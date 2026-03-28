@@ -25,5 +25,18 @@ ATLAS OS je napredni, asinkroni AI sloj optimiziran za rad unutar Termux okruže
 4. Pokreni sustav:
    `python main.py`
 
+## 🗺️ Roadmap
+
+Iduće faze razvoja ATLAS OS-a:
+
+- 🤖 **Vision AI Integration (Llama-3.2-Vision)**
+  Napredna analiza vizualnih podataka s lokalnim Vision modelima za real-time procesiranje slika unutar Termux okruženja.
+
+- 🔒 **Python Sandbox Executor (Sigurno izvršavanje koda)**
+  Sigurna AST-bazirana evaluacija Python koda s ograničenjima izvršavanja i zaštitom od opasnih operacija.
+
+- ☁️ **Google Cloud Backup (rclone integracija)**
+  Automatizirana rclone sinhronizacija `database.db` datoteke na Google Drive s 200GB prostora. Skriptu pokreneš sa `python cloud_backup.py`.
+
 ## ⚖️ Licenca
 MIT License - vidi [LICENSE](LICENSE) datoteku za detalje.
