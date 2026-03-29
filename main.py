@@ -21,13 +21,12 @@ GROQ_MODELS = [
 ]
 GEMINI_MODELS = [
     "gemini-2.0-flash",
-    "gemini-2.5-flash",
+    "gemini-1.5-flash",
     "gemini-2.0-flash-lite",
-    "gemini-flash-latest",
 ]
 GROQ_VISION_MODELS = [
-    "llama-3.2-11b-vision-preview",
-    "llama-3.2-90b-vision-preview",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
 ]
 
 _groq_model   = None
@@ -111,7 +110,8 @@ async def update_profile(user_msg: str):
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.post("https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                json={"model": model, "max_tokens": 150, "temperature": 0.1, "messages": [{"role": "user", "content": prompt}]})
+                json={"model": model, "max_tokens": 150, "temperature": 0.1,
+                      "messages": [{"role": "user", "content": prompt}]})
             if r.status_code != 200: return
             raw = re.sub(r"```json?", "", r.json()["choices"][0]["message"]["content"]).replace("```","").strip()
             async with aiosqlite.connect(DB_PATH) as db:
@@ -155,7 +155,8 @@ def extract_urls(text: str) -> list:
     return [u for u in found if not any(b in u for b in URL_BLACKLIST)]
 
 async def fetch_url_content(url: str) -> tuple:
-    headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36", "Accept": "text/html,application/xhtml+xml,application/pdf,*/*;q=0.9"}
+    headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36",
+               "Accept": "text/html,application/xhtml+xml,application/pdf,*/*;q=0.9"}
     try:
         async with httpx.AsyncClient(timeout=25, follow_redirects=True, verify=False) as client:
             r = await client.get(url, headers=headers)
@@ -166,7 +167,9 @@ async def fetch_url_content(url: str) -> tuple:
                 try: return json.dumps(r.json(), indent=2, ensure_ascii=False)[:3000], "json"
                 except: return r.text[:3000], "json"
             html = r.text
-            for pat in [r'<script[^>]*>.*?</script>', r'<style[^>]*>.*?</style>', r'<nav[^>]*>.*?</nav>', r'<footer[^>]*>.*?</footer>', r'<header[^>]*>.*?</header>', r'<!--.*?-->']:
+            for pat in [r'<script[^>]*>.*?</script>', r'<style[^>]*>.*?</style>',
+                        r'<nav[^>]*>.*?</nav>', r'<footer[^>]*>.*?</footer>',
+                        r'<header[^>]*>.*?</header>', r'<!--.*?-->']:
                 html = re.sub(pat, '', html, flags=re.DOTALL|re.IGNORECASE)
             html = re.sub(r'<[^>]+>', ' ', html)
             html = re.sub(r'&[a-zA-Z]+;', ' ', html)
@@ -186,20 +189,29 @@ def _parse_pdf(content: bytes) -> str:
         return f"[PDF — {len(reader.pages)} stranica]\n{text[:5000]}"
     except ImportError:
         try:
-            raw = content.decode("latin-1", errors="ignore")
-            chunks = re.findall(r'BT\s*(.*?)\s*ET', raw, re.DOTALL)
-            texts = [p for c in chunks for p in re.findall(r'\((.*?)\)', c)]
-            result = " ".join(texts)
-            if result: return f"[PDF parcijalno]\n{result[:4000]}"
-        except: pass
-        return "[PDF ucitan. Instaliraj: pip install pypdf]"
+            from PyPDF2 import PdfReader
+            reader = PdfReader(io.BytesIO(content))
+            text = ""
+            for i, page in enumerate(reader.pages[:12]):
+                text += f"\n--- Str. {i+1} ---\n{page.extract_text() or ''}"
+            return f"[PDF — {len(reader.pages)} stranica]\n{text[:5000]}"
+        except ImportError:
+            try:
+                raw = content.decode("latin-1", errors="ignore")
+                chunks = re.findall(r'BT\s*(.*?)\s*ET', raw, re.DOTALL)
+                texts = [p for c in chunks for p in re.findall(r'\((.*?)\)', c)]
+                result = " ".join(texts)
+                if result: return f"[PDF parcijalno]\n{result[:4000]}"
+            except: pass
+            return "[PDF ucitan. Instaliraj: pip install pypdf]"
     except Exception as e: return f"[PDF greska: {str(e)[:100]}]"
 
 def _parse_file(name: str, content: str) -> str:
     ext = name.lower().split(".")[-1] if "." in name else ""
     if ext == "pdf":
         try:
-            raw = base64.b64decode(content.split(",")[1] if "," in content else content)
+            b64 = content.split(",")[1] if "," in content else content
+            raw = base64.b64decode(b64)
             return _parse_pdf(raw)
         except Exception as e: return f"[PDF greska: {e}]"
     if ext == "csv": return f"[CSV]\n" + "\n".join(content.split("\n")[:50])
@@ -228,7 +240,8 @@ def run_backup(filepath: str = "") -> str:
             if not os.path.isabs(fp):
                 fp = os.path.join(os.path.expanduser("~"), "atlas_os_v1", fp)
             if os.path.exists(fp):
-                result = subprocess.run(["rclone", "copy", fp, "remote:AtlasBackup/", "-v"], capture_output=True, text=True, timeout=120)
+                result = subprocess.run(["rclone", "copy", fp, "remote:AtlasBackup/", "-v"],
+                                        capture_output=True, text=True, timeout=120)
                 return f"Fajl prenesen: {os.path.basename(fp)}" if result.returncode == 0 else f"rclone greska: {result.stderr[:200]}"
             return f"Fajl nije pronaden: {fp}"
         result = subprocess.run(["python", "cloud_backup.py"], capture_output=True, text=True, timeout=120)
@@ -238,7 +251,9 @@ def run_backup(filepath: str = "") -> str:
     except Exception as e: return f"Backup greska: {str(e)[:100]}"
 
 def _detect_backup_file(msg: str) -> str:
-    for p in [r'prenesi\s+["\']?(.+?)["\']?\s+na\s+oblak', r'upload\s+["\']?(.+?)["\']?\s+(?:na|to)\s+(?:oblak|cloud)', r'spremi\s+["\']?(.+?)["\']?\s+na\s+oblak']:
+    for p in [r'prenesi\s+["\']?(.+?)["\']?\s+na\s+oblak',
+              r'upload\s+["\']?(.+?)["\']?\s+(?:na|to)\s+(?:oblak|cloud)',
+              r'spremi\s+["\']?(.+?)["\']?\s+na\s+oblak']:
         m = re.search(p, msg.lower())
         if m: return m.group(1).strip()
     return ""
@@ -250,7 +265,7 @@ def run_git_update() -> str:
     except Exception as e: return f"Git greska: {e}"
 
 LANG_RULES = {
-    "hr": "Jezik: standardni hrvatski knjizevni. STROGO bez ijekavice. Pravilno: 'ne','je','bel','mleko','dete'. Gramaticki ispravno.",
+    "hr": "Jezik: standardni hrvatski knjizevni. Gramaticki ispravno.",
     "en": "Language: fluent, natural English.",
     "de": "Sprache: fließendes, natürliches Deutsch.",
     "fr": "Langue: français courant et naturel.",
@@ -280,7 +295,7 @@ def build_system(profile: dict, mode: str, lang: str, media_mode: str) -> str:
         f"MOD: {mode.upper()} — {MODE_INSTRUCTIONS.get(mode, MODE_INSTRUCTIONS['fast'])}\n"
         f"{LANG_RULES.get(lang, LANG_RULES['hr'])}\n"
         f"KARAKTER: Direktan. Iskren. Bez laskanja. Bez 'Naravno!' i slicnih fraza. Ako korisnik grjesi reci mu konstruktivno.\n"
-        f"SPOSOBNOSTI: Citas URL-ove i PDF-ove. Web pretraga. Google Cloud backup. Pamtis razgovor.\n"
+        f"SPOSOBNOSTI: Citas URL-ove i PDF-ove. Web pretraga. Google Cloud backup. Pamtis razgovor. Analiziras audio i video.\n"
         + (f"PROFIL: {user_ctx}\n" if user_ctx else "")
         + "Kod u blokovima. Tablice u markdown formatu."
     )
@@ -312,13 +327,15 @@ async def call_groq(messages: list, temp: float) -> str | None:
 
 async def call_gemini(messages: list) -> str | None:
     global _gemini_model
-    prompt = "\n".join(f"{'ATLAS' if m['role']=='assistant' else 'KORISNIK'}: {m['content']}" for m in messages if isinstance(m.get("content"),str))
+    prompt = "\n".join(f"{'ATLAS' if m['role']=='assistant' else 'KORISNIK'}: {m['content']}"
+                       for m in messages if isinstance(m.get("content"), str))
     if len(prompt) > 18000: prompt = prompt[-18000:]
     order = ([_gemini_model] + [m for m in GEMINI_MODELS if m != _gemini_model] if _gemini_model else GEMINI_MODELS)
     async with httpx.AsyncClient(timeout=45) as client:
         for model in order:
             try:
-                r = await client.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}",
+                r = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}",
                     json={"contents": [{"parts": [{"text": prompt}]}]})
                 if r.status_code == 200:
                     if _gemini_model != model: print(f"[GEMINI] Aktivan: {model}"); _gemini_model = model
@@ -330,7 +347,8 @@ async def call_gemini(messages: list) -> str | None:
     return None
 
 async def call_ai(messages: list, mode: str = "fast") -> tuple:
-    temp = {"fast":0.35,"analysis":0.2,"creative":0.75,"code":0.1,"search":0.3,"url":0.2,"video":0.3,"audio":0.3,"photo":0.3}.get(mode,0.35)
+    temp = {"fast":0.35,"analysis":0.2,"creative":0.75,"code":0.1,"search":0.3,
+            "url":0.2,"video":0.3,"audio":0.3,"photo":0.3}.get(mode, 0.35)
     out = await call_groq(messages, temp)
     if out: return out, _groq_model or "GROQ"
     print("[ATLAS] Groq nedostupan → Gemini")
@@ -341,25 +359,56 @@ async def call_ai(messages: list, mode: str = "fast") -> tuple:
 async def call_vision(image_data: str, prompt: str) -> tuple:
     global _vision_model
     b64 = image_data.split(",")[-1] if "," in image_data else image_data
-    order = ([_vision_model] + [m for m in GROQ_VISION_MODELS if m != _vision_model] if _vision_model else GROQ_VISION_MODELS)
+    order = ([_vision_model] + [m for m in GROQ_VISION_MODELS if m != _vision_model]
+             if _vision_model else GROQ_VISION_MODELS)
     async with httpx.AsyncClient(timeout=40) as client:
         for model in order:
             try:
                 r = await client.post("https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
                     json={"model": model, "max_tokens": 900, "temperature": 0.2,
-                          "messages": [{"role":"user","content":[{"type":"text","text":prompt or "Analiziraj ovu sliku detaljno."},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}]}]})
-                if r.status_code == 200: _vision_model = model; return r.json()["choices"][0]["message"]["content"], "GROQ VISION"
-                print(f"[VISION] {model} — {r.status_code}")
+                          "messages": [{"role":"user","content":[
+                              {"type":"text","text": prompt or "Analiziraj ovu sliku detaljno."},
+                              {"type":"image_url","image_url":{"url": f"data:image/jpeg;base64,{b64}"}}
+                          ]}]})
+                if r.status_code == 200:
+                    _vision_model = model
+                    return r.json()["choices"][0]["message"]["content"], "GROQ VISION"
+                print(f"[VISION] {model} — {r.status_code}: {r.text[:100]}")
             except Exception as e: print(f"[VISION] {model}: {e}")
+    # Gemini Vision fallback
     try:
         gem = _gemini_model or GEMINI_MODELS[0]
         async with httpx.AsyncClient(timeout=40) as client:
-            r = await client.post(f"https://generativelanguage.googleapis.com/v1beta/models/{gem}:generateContent?key={GEMINI_API_KEY}",
-                json={"contents":[{"parts":[{"text":prompt or "Analiziraj ovu sliku."},{"inline_data":{"mime_type":"image/jpeg","data":b64}}]}]})
-            if r.status_code == 200: return r.json()["candidates"][0]["content"]["parts"][0]["text"], "GEMINI VISION"
+            r = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{gem}:generateContent?key={GEMINI_API_KEY}",
+                json={"contents":[{"parts":[
+                    {"text": prompt or "Analiziraj ovu sliku."},
+                    {"inline_data":{"mime_type":"image/jpeg","data": b64}}
+                ]}]})
+            if r.status_code == 200:
+                return r.json()["candidates"][0]["content"]["parts"][0]["text"], "GEMINI VISION"
+            print(f"[VISION GEMINI] {r.status_code}: {r.text[:100]}")
     except Exception as e: print(f"[VISION GEMINI]: {e}")
     return "Vision analiza nedostupna.", "ERROR"
+
+async def call_gemini_media(b64: str, mime: str, prompt: str) -> str | None:
+    """Gemini analiza audio/video sadržaja."""
+    try:
+        gem = _gemini_model or GEMINI_MODELS[0]
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{gem}:generateContent?key={GEMINI_API_KEY}",
+                json={"contents":[{"parts":[
+                    {"text": prompt or "Analiziraj ovaj medijski sadržaj."},
+                    {"inline_data":{"mime_type": mime, "data": b64}}
+                ]}]})
+            if r.status_code == 200:
+                return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            print(f"[MEDIA GEMINI] {r.status_code}: {r.text[:150]}")
+    except Exception as e:
+        print(f"[MEDIA GEMINI] {e}")
+    return None
 
 HTML = r"""<!DOCTYPE html>
 <html lang="hr">
@@ -465,7 +514,7 @@ body{background:var(--bg);color:var(--tx);font-family:'Syne',sans-serif;display:
 <canvas id="cvs"></canvas>
 <div class="ov" id="ov" onclick="closeSb()"></div>
 <aside class="sb" id="sb">
-  <div class="sb-hd"><div class="sb-logo">ATLAS</div><div class="sb-sub">OS v16.0 · IMAGO</div></div>
+  <div class="sb-hd"><div class="sb-logo">ATLAS</div><div class="sb-sub">OS v17.0 · IMAGO</div></div>
   <div class="sb-bd">
     <div class="sb-sec">Sesija</div>
     <div class="si" onclick="newSess()">✦ &nbsp;Nova sesija</div>
@@ -478,7 +527,7 @@ body{background:var(--bg);color:var(--tx);font-family:'Syne',sans-serif;display:
     <div class="si am"  id="m-audio" onclick="setMod('audio')">🎵 &nbsp;Audio / Glazba</div>
     <div class="si pm"  id="m-photo" onclick="setMod('photo')">📷 &nbsp;Foto / Slika</div>
   </div>
-  <div class="sb-ft">ATLAS AI OS · Groq + Gemini · Termux Edition</div>
+  <div class="sb-ft">ATLAS AI OS · Groq + Gemini · v17.0</div>
 </aside>
 <header class="hdr">
   <button onclick="openSb()" style="background:none;border:none;color:var(--acc);font-size:23px;cursor:pointer;line-height:1">☰</button>
@@ -492,12 +541,16 @@ body{background:var(--bg);color:var(--tx);font-family:'Syne',sans-serif;display:
 </header>
 <div class="mbar" id="mbar"></div>
 <div class="chat" id="chat">
-  <div class="msg"><div class="mm"><span class="mw atlas">Atlas</span></div><div>Sustav aktivan. Memorija ucitana. Groq + Gemini online. Spreman.</div><div class="mt">BOOT · v16.0</div></div>
+  <div class="msg"><div class="mm"><span class="mw atlas">Atlas</span></div>
+  <div>Sustav aktivan. Memorija ucitana. Groq + Gemini online.<br>
+  <small style="color:var(--mu)">PDF ✓ &nbsp;Slike ✓ &nbsp;Audio ✓ &nbsp;Video ✓ &nbsp;URL ✓</small></div>
+  <div class="mt">BOOT · v17.0</div></div>
 </div>
 <div id="find">📎 <span id="fname"></span><span onclick="clrF()" style="cursor:pointer;color:var(--rd);margin-left:5px">✕</span></div>
 <div class="izone">
   <div class="ibox" id="ibox">
-    <input type="file" id="fi" style="display:none" onchange="onFile(this)" accept="image/*,text/*,.py,.js,.json,.csv,.md,.pdf,.txt,.xml">
+    <input type="file" id="fi" style="display:none" onchange="onFile(this)"
+      accept="image/*,audio/*,video/*,application/pdf,text/*,.py,.js,.json,.csv,.md,.txt,.xml,.pdf">
     <button class="ibtn" onclick="document.getElementById('fi').click()">📎</button>
     <textarea id="inp" placeholder="Pitaj Atlas... ili zalijepi URL" rows="1" oninput="ar(this)" onkeydown="hk(event)"></textarea>
     <button class="ibtn sbtn" id="sbtn" onclick="send()">➤</button>
@@ -505,20 +558,100 @@ body{background:var(--bg);color:var(--tx);font-family:'Syne',sans-serif;display:
 </div>
 <script>
 let ws,pF=null,typEl=null,cMod='text';
-const MODS={text:{label:'Tekst mod',ph:'Pitaj Atlas... ili zalijepi URL',cls:''},video:{label:'Video obrada',ph:'Montaza, kodeci, FPS, export...',cls:'video',tools:['🎬 Montaza','⚙️ Kodeci','📐 Rezolucija','🎞️ FPS','🔊 Audio sync','📤 Export']},audio:{label:'Audio / Glazba',ph:'Mix, EQ, snimanje, format...',cls:'audio',tools:['🎵 Mix','🎤 Snimanje','🔉 EQ','🥁 Ritam','📻 Format','💿 Export']},photo:{label:'Foto / Slika',ph:'Editing, boja, crop, kompozicija...',cls:'photo',tools:['🖼️ Edit','🎨 Boja','✂️ Crop','💡 Ekspozicija','🔲 Kompozicija','📁 Export']}};
-function setMod(m){cMod=m;const cfg=MODS[m];['text','video','audio','photo'].forEach(x=>document.getElementById('m-'+x).classList.toggle('act',x===m));document.getElementById('mlabel').textContent=cfg.label;document.getElementById('inp').placeholder=cfg.ph;const mp=document.getElementById('modp');mp.textContent=m.toUpperCase();mp.className='modp '+(m!=='text'?m:'');document.getElementById('ibox').className='ibox '+cfg.cls;document.getElementById('sbtn').className='ibtn sbtn '+cfg.cls;const bar=document.getElementById('mbar');if(cfg.tools){bar.className='mbar show '+m;bar.innerHTML=cfg.tools.map(t=>`<button class="mbtn" onclick="qp('${t}')">${t}</button>`).join('');}else{bar.className='mbar';bar.innerHTML='';}if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'media_mode',mode:m}));closeSb();}
+const MODS={
+  text:{label:'Tekst mod',ph:'Pitaj Atlas... ili zalijepi URL',cls:''},
+  video:{label:'Video obrada',ph:'Montaza, kodeci, FPS, export...',cls:'video',tools:['🎬 Montaza','⚙️ Kodeci','📐 Rezolucija','🎞️ FPS','🔊 Audio sync','📤 Export']},
+  audio:{label:'Audio / Glazba',ph:'Mix, EQ, snimanje, format...',cls:'audio',tools:['🎵 Mix','🎤 Snimanje','🔉 EQ','🥁 Ritam','📻 Format','💿 Export']},
+  photo:{label:'Foto / Slika',ph:'Editing, boja, crop, kompozicija...',cls:'photo',tools:['🖼️ Edit','🎨 Boja','✂️ Crop','💡 Ekspozicija','🔲 Kompozicija','📁 Export']}
+};
+function setMod(m){
+  cMod=m;const cfg=MODS[m];
+  ['text','video','audio','photo'].forEach(x=>document.getElementById('m-'+x).classList.toggle('act',x===m));
+  document.getElementById('mlabel').textContent=cfg.label;
+  document.getElementById('inp').placeholder=cfg.ph;
+  const mp=document.getElementById('modp');mp.textContent=m.toUpperCase();mp.className='modp '+(m!=='text'?m:'');
+  document.getElementById('ibox').className='ibox '+cfg.cls;
+  document.getElementById('sbtn').className='ibtn sbtn '+cfg.cls;
+  const bar=document.getElementById('mbar');
+  if(cfg.tools){bar.className='mbar show '+m;bar.innerHTML=cfg.tools.map(t=>`<button class="mbtn" onclick="qp('${t}')">${t}</button>`).join('');}
+  else{bar.className='mbar';bar.innerHTML='';}
+  if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'media_mode',mode:m}));
+  closeSb();
+}
 function qp(t){document.getElementById('inp').value=t.replace(/\p{Emoji}/gu,'').trim()+': ';document.getElementById('inp').focus();}
-function conn(){ws=new WebSocket('ws://'+location.host+'/ws');ws.onopen=()=>setWs(true);ws.onclose=()=>{setWs(false);setTimeout(conn,2500);};ws.onmessage=e=>{const d=JSON.parse(e.data);if(d.type==='metrics'){document.getElementById('cpu').textContent=d.data.cpu;document.getElementById('mem').textContent=d.data.mem;return;}rmTyp();if(d.action==='reload'){location.reload();return;}if(d.message)addMsg('atlas',d.message,d.model,d.tags||[],d.mode||'');if(d.error)addMsg('error',d.error,null,[]);};}
+function conn(){
+  ws=new WebSocket('ws://'+location.host+'/ws');
+  ws.onopen=()=>setWs(true);
+  ws.onclose=()=>{setWs(false);setTimeout(conn,2500);};
+  ws.onmessage=e=>{
+    const d=JSON.parse(e.data);
+    if(d.type==='metrics'){document.getElementById('cpu').textContent=d.data.cpu;document.getElementById('mem').textContent=d.data.mem;return;}
+    rmTyp();
+    if(d.action==='reload'){location.reload();return;}
+    if(d.message)addMsg('atlas',d.message,d.model,d.tags||[],d.mode||'');
+    if(d.error)addMsg('error',d.error,null,[]);
+  };
+}
 function setWs(on){document.getElementById('wdot').className='wdot '+(on?'on':'off');}
-function setPill(model){if(!model)return;const el=document.getElementById('mpill');el.textContent=model.split(' ')[0];const m=model.toLowerCase();el.className='mpill '+(m.includes('gemini')?'gemini':m.includes('error')?'error':'groq');}
-function addMsg(type,text,model,tags,mode){const chat=document.getElementById('chat');const now=new Date().toLocaleTimeString('hr',{hour:'2-digit',minute:'2-digit'});const d=document.createElement('div');d.className='msg '+(type==='atlas'?'':type);const who=type==='atlas'?'Atlas':type==='error'?'Greška':'Ti';const wc=type==='atlas'?'atlas':type==='error'?'err':'user';let meta=`<div class="mm"><span class="mw ${wc}">${who}</span>`;if(model){const mc=model.toLowerCase().includes('gemini')?'gemini':'groq';meta+=`<span class="tg ${mc}">${model.split(' ')[0]}</span>`;setPill(model);}['web','url','pdf','vision','cloud','code','analysis','video','audio','photo'].forEach(t=>{if(tags.includes(t))meta+=`<span class="tg ${t}">${t.toUpperCase()}</span>`;});meta+='</div>';if(mode&&!['fast','text','url'].includes(mode))document.getElementById('modp').textContent=mode.toUpperCase();d.innerHTML=meta+`<div>${esc(text)}</div><div class="mt">${now}</div>`;chat.appendChild(d);chat.scrollTop=chat.scrollHeight;}
-function showTyp(){const chat=document.getElementById('chat');typEl=document.createElement('div');typEl.className='msg';typEl.innerHTML=`<div class="mm"><span class="mw atlas">Atlas</span></div><div class="dots"><span></span><span></span><span></span></div>`;chat.appendChild(typEl);chat.scrollTop=chat.scrollHeight;}
+function setPill(model){
+  if(!model)return;
+  const el=document.getElementById('mpill');el.textContent=model.split(' ')[0];
+  const m=model.toLowerCase();el.className='mpill '+(m.includes('gemini')?'gemini':m.includes('error')?'error':'groq');
+}
+function addMsg(type,text,model,tags,mode){
+  const chat=document.getElementById('chat');
+  const now=new Date().toLocaleTimeString('hr',{hour:'2-digit',minute:'2-digit'});
+  const d=document.createElement('div');d.className='msg '+(type==='atlas'?'':type);
+  const who=type==='atlas'?'Atlas':type==='error'?'Greška':'Ti';
+  const wc=type==='atlas'?'atlas':type==='error'?'err':'user';
+  let meta=`<div class="mm"><span class="mw ${wc}">${who}</span>`;
+  if(model){const mc=model.toLowerCase().includes('gemini')?'gemini':'groq';meta+=`<span class="tg ${mc}">${model.split(' ')[0]}</span>`;setPill(model);}
+  ['web','url','pdf','vision','cloud','code','analysis','video','audio','photo'].forEach(t=>{if(tags.includes(t))meta+=`<span class="tg ${t}">${t.toUpperCase()}</span>`;});
+  meta+='</div>';
+  if(mode&&!['fast','text','url'].includes(mode))document.getElementById('modp').textContent=mode.toUpperCase();
+  d.innerHTML=meta+`<div>${esc(text)}</div><div class="mt">${now}</div>`;
+  chat.appendChild(d);chat.scrollTop=chat.scrollHeight;
+}
+function showTyp(){
+  const chat=document.getElementById('chat');
+  typEl=document.createElement('div');typEl.className='msg';
+  typEl.innerHTML=`<div class="mm"><span class="mw atlas">Atlas</span></div><div class="dots"><span></span><span></span><span></span></div>`;
+  chat.appendChild(typEl);chat.scrollTop=chat.scrollHeight;
+}
 function rmTyp(){if(typEl){typEl.remove();typEl=null;}}
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');}
 function ar(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,100)+'px';}
 function hk(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}}
-function send(){const inp=document.getElementById('inp');const txt=inp.value.trim();if(!txt&&!pF)return;const chat=document.getElementById('chat');const d=document.createElement('div');d.className='msg user';const badge=pF?`<div class="fbg">📎 ${pF.name}</div>`:'';d.innerHTML=`<div class="mm"><span class="mw user">Ti</span></div>${badge}<div>${esc(txt)}</div>`;chat.appendChild(d);chat.scrollTop=chat.scrollHeight;showTyp();ws.send(JSON.stringify({text:txt,file:pF,mediaMode:cMod}));inp.value='';inp.style.height='auto';clrF();}
-function onFile(input){const file=input.files[0];if(!file)return;const reader=new FileReader();reader.onload=e=>{pF={name:file.name,type:file.type,data:e.target.result,isImage:file.type.startsWith('image/')};document.getElementById('find').style.display='block';document.getElementById('fname').textContent=file.name;};if(file.type.startsWith('image/'))reader.readAsDataURL(file);else reader.readAsText(file);}
+function send(){
+  const inp=document.getElementById('inp');const txt=inp.value.trim();
+  if(!txt&&!pF)return;
+  const chat=document.getElementById('chat');
+  const d=document.createElement('div');d.className='msg user';
+  const badge=pF?`<div class="fbg">📎 ${pF.name}</div>`:'';
+  d.innerHTML=`<div class="mm"><span class="mw user">Ti</span></div>${badge}<div>${esc(txt)}</div>`;
+  chat.appendChild(d);chat.scrollTop=chat.scrollHeight;
+  showTyp();
+  ws.send(JSON.stringify({text:txt,file:pF,mediaMode:cMod}));
+  inp.value='';inp.style.height='auto';clrF();
+}
+function onFile(input){
+  const file=input.files[0];if(!file)return;
+  const ext=file.name.split('.').pop().toLowerCase();
+  const isImg=file.type.startsWith('image/');
+  const isPdf=ext==='pdf'||file.type==='application/pdf';
+  const isAudio=file.type.startsWith('audio/')||['mp3','wav','ogg','flac','m4a','aac'].includes(ext);
+  const isVideo=file.type.startsWith('video/')||['mp4','mkv','avi','mov','webm'].includes(ext);
+  const reader=new FileReader();
+  reader.onload=e=>{
+    pF={name:file.name,type:file.type,data:e.target.result,
+        isImage:isImg,isPdf:isPdf,isAudio:isAudio,isVideo:isVideo,ext:ext};
+    document.getElementById('find').style.display='block';
+    document.getElementById('fname').textContent=file.name;
+  };
+  // PDF, slike, audio, video — sve kao base64
+  if(isImg||isPdf||isAudio||isVideo) reader.readAsDataURL(file);
+  else reader.readAsText(file);
+}
 function clrF(){pF=null;document.getElementById('find').style.display='none';document.getElementById('fi').value='';}
 function openSb(){document.getElementById('sb').classList.add('open');document.getElementById('ov').classList.add('on');}
 function closeSb(){document.getElementById('sb').classList.remove('open');document.getElementById('ov').classList.remove('on');}
@@ -540,11 +673,14 @@ window.onresize=resize;resize();draw();conn();
 
 @app.get("/manifest.json")
 async def manifest():
-    return JSONResponse({"name":"ATLAS OS","short_name":"ATLAS","start_url":"/","display":"standalone","background_color":"#000","theme_color":"#0ea5e9","icons":[{"src":"https://cdn-icons-png.flaticon.com/512/714/714390.png","sizes":"512x512","type":"image/png"}]})
+    return JSONResponse({"name":"ATLAS OS","short_name":"ATLAS","start_url":"/","display":"standalone",
+                         "background_color":"#000","theme_color":"#0ea5e9",
+                         "icons":[{"src":"https://cdn-icons-png.flaticon.com/512/714/714390.png","sizes":"512x512","type":"image/png"}]})
 
 @app.get("/sw.js")
 async def sw():
-    return HTMLResponse("self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(clients.claim()));self.addEventListener('fetch',e=>{});", media_type="application/javascript")
+    return HTMLResponse("self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(clients.claim()));self.addEventListener('fetch',e=>{});",
+                        media_type="application/javascript")
 
 @app.get("/")
 async def home():
@@ -556,42 +692,83 @@ async def ws_endpoint(websocket: WebSocket):
     await init_db()
     loop = asyncio.get_event_loop()
     session_media = "text"
+
     while True:
         try:
             raw = await websocket.receive_text()
+
             if raw == "__METRICS__":
                 m = await loop.run_in_executor(None, get_metrics)
                 await websocket.send_json({"type":"metrics","data":m}); continue
+
             if raw == "__CLEAR__":
-                await clear_db(); await websocket.send_json({"action":"reload"}); continue
+                await clear_db()
+                await websocket.send_json({"action":"reload"}); continue
+
             if raw == "__BACKUP__":
                 msg = await loop.run_in_executor(None, run_backup, "")
                 await websocket.send_json({"message":msg,"model":"SYSTEM","tags":["cloud"],"mode":"fast"}); continue
+
             if raw == "__GIT_UPDATE__":
                 msg = await loop.run_in_executor(None, run_git_update)
                 await websocket.send_json({"message":msg,"model":"SYSTEM","tags":[],"mode":"fast"}); continue
+
             try: data = json.loads(raw)
             except: data = {"text": raw}
+
             if data.get("type") == "media_mode":
                 session_media = data.get("mode","text"); continue
+
             user_msg   = data.get("text","").strip()
             file_data  = data.get("file")
             media_mode = data.get("mediaMode", session_media)
+
             if not user_msg and not file_data: continue
             if user_msg: asyncio.create_task(update_profile(user_msg))
+
             lang = detect_language(user_msg) if user_msg else "hr"
+
+            # Backup po imenu fajla
             backup_kw = ["prenesi na oblak","upload na oblak","spremi na oblak","prenesi fajl","backup fajl"]
             if any(k in user_msg.lower() for k in backup_kw):
                 fname = _detect_backup_file(user_msg)
                 msg = await loop.run_in_executor(None, run_backup, fname)
                 await save_msg("user", user_msg); await save_msg("assistant", msg)
                 await websocket.send_json({"message":msg,"model":"SYSTEM","tags":["cloud"],"mode":"fast"}); continue
+
+            # ── SLIKA → Vision ──
             if file_data and file_data.get("isImage"):
                 out, model = await call_vision(file_data["data"], user_msg)
-                await save_msg("user", f"[SLIKA] {user_msg[:150]}"); await save_msg("assistant", out)
+                await save_msg("user", f"[SLIKA] {user_msg[:150]}")
+                await save_msg("assistant", out)
                 await websocket.send_json({"message":out,"model":model,"tags":["vision"],"mode":"analysis"}); continue
+
+            # ── AUDIO → Gemini ──
+            if file_data and file_data.get("isAudio"):
+                b64  = file_data["data"].split(",")[-1] if "," in file_data["data"] else file_data["data"]
+                mime = file_data.get("type","audio/mpeg")
+                out  = await call_gemini_media(b64, mime, user_msg or "Transkribiraj i analiziraj ovaj audio.")
+                if out:
+                    await save_msg("user", f"[AUDIO] {user_msg[:150]}")
+                    await save_msg("assistant", out)
+                    await websocket.send_json({"message":out,"model":"GEMINI","tags":["audio"],"mode":"audio"}); continue
+                await websocket.send_json({"message":"Audio analiza trenutno nedostupna.","model":"ERROR","tags":["audio"],"mode":"audio"}); continue
+
+            # ── VIDEO → Gemini ──
+            if file_data and file_data.get("isVideo"):
+                b64  = file_data["data"].split(",")[-1] if "," in file_data["data"] else file_data["data"]
+                mime = file_data.get("type","video/mp4")
+                out  = await call_gemini_media(b64, mime, user_msg or "Analiziraj ovaj video sadržaj.")
+                if out:
+                    await save_msg("user", f"[VIDEO] {user_msg[:150]}")
+                    await save_msg("assistant", out)
+                    await websocket.send_json({"message":out,"model":"GEMINI","tags":["video"],"mode":"video"}); continue
+                await websocket.send_json({"message":"Video analiza trenutno nedostupna.","model":"ERROR","tags":["video"],"mode":"video"}); continue
+
             mode = detect_mode(user_msg)
             tags = []; extra_ctx = ""
+
+            # ── URL čitanje ──
             urls = extract_urls(user_msg) if user_msg else []
             if urls:
                 parts = []
@@ -602,25 +779,46 @@ async def ws_endpoint(websocket: WebSocket):
                     tags.append("pdf" if ctype == "pdf" else "url")
                 extra_ctx = "\n\n" + "\n\n---\n\n".join(parts)
                 mode = "url"
+
+            # ── Web search ──
             elif mode == "search":
                 is_news = any(k in user_msg.lower() for k in ["vijesti","news","danas","today","trenutno"])
                 web = await loop.run_in_executor(None, _web_search, user_msg, is_news)
                 if web: extra_ctx = f"\n\n[WEB REZULTATI]\n{web}"; tags.append("web")
-            if file_data and not file_data.get("isImage"):
-                fname = file_data.get("name","nepoznato"); fcontent = file_data.get("data","")
-                parsed = _parse_file(fname, fcontent)
+
+            # ── PDF upload ──
+            if file_data and file_data.get("isPdf"):
+                fname   = file_data.get("name","dokument.pdf")
+                fdata   = file_data.get("data","")
+                parsed  = _parse_file(fname, fdata)
                 extra_ctx += f"\n\n{parsed}"
-                if fname.lower().endswith(".pdf"): tags.append("pdf")
+                tags.append("pdf")
+
+            # ── Ostale datoteke (tekst, kod, CSV, JSON) ──
+            elif file_data and not file_data.get("isImage") and not file_data.get("isAudio") and not file_data.get("isVideo") and not file_data.get("isPdf"):
+                fname   = file_data.get("name","nepoznato")
+                fcontent = file_data.get("data","")
+                parsed  = _parse_file(fname, fcontent)
+                extra_ctx += f"\n\n{parsed}"
+
             profile    = await get_profile()
             history    = await get_history(10)
             sys_prompt = build_system(profile, mode, lang, media_mode)
+
             user_content = user_msg
             if extra_ctx: user_content = f"{user_msg}\n{extra_ctx[:3500]}"
+
             messages = [{"role":"system","content":sys_prompt}] + history + [{"role":"user","content":user_content}]
+
             out, model = await call_ai(messages, mode)
-            await save_msg("user", user_msg[:400]); await save_msg("assistant", out[:600])
-            if media_mode != "text": tags.append(media_mode)
+            await save_msg("user", user_msg[:400])
+            await save_msg("assistant", out[:600])
+
+            if media_mode != "text" and media_mode not in tags:
+                tags.append(media_mode)
+
             await websocket.send_json({"message":out,"model":model,"tags":tags,"mode":mode})
+
         except WebSocketDisconnect: break
         except Exception as e:
             print(f"[ATLAS ERROR] {e}")
