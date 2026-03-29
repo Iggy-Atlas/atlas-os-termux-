@@ -93,7 +93,7 @@ async def save_msg(role, content):
         await db.execute("INSERT INTO memory (role, content, timestamp) VALUES (?,?,?)", (role, str(content)[:500], str(datetime.now())))
         await db.commit()
 
-async def get_history(limit=8):
+async def get_history(limit=20): # POVEĆAN LIMIT MEMORIJE ZA BOLJI KONTEKST
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT role, content FROM memory ORDER BY id DESC LIMIT ?", (limit,)) as c:
             rows = await c.fetchall()
@@ -107,8 +107,8 @@ async def get_profile() -> dict:
     except: return {}
 
 def detect_language(text):
-    hr = sum(1 for w in ["što", "kako", "imam", "mogu"] if w in text.lower())
-    en = sum(1 for w in ["what", "how", "have", "can"] if w in text.lower())
+    hr = sum(1 for w in ["što", "kako", "imam", "mogu", "ovdje"] if w in text.lower())
+    en = sum(1 for w in ["what", "how", "have", "can", "here"] if w in text.lower())
     return "en" if en > hr else "hr"
 
 def detect_mode(msg):
@@ -118,8 +118,14 @@ def detect_mode(msg):
     return "fast"
 
 def build_system(profile, media_mode, lang):
-    l_rule = "Respond in English." if lang == "en" else "Hrvatski jezik. BEZ ijekavice."
-    return f"Ti si ATLAS — napredan AI sustav. MOD: {media_mode.upper()}.\nJEZIK: {l_rule}\nMOĆI: VISION, WIKIPEDIA.\nKARAKTER: Iskren."
+    # UKLONJENA IJEKAVICA - UNIVERZALNA JEZIČNA SPOSOBNOST
+    l_rule = "Respond in English." if lang == "en" else "Hrvatski književni jezik."
+    return (
+        f"Ti si ATLAS — vrhunski AI sustav. MOD: {media_mode.upper()}.\n"
+        f"JEZIK: {l_rule} Budi spreman tečno komunicirati na bilo kojem književnom jeziku.\n"
+        f"ZADATAK: Analiziraj povijest razgovora i nadovezuj se na prethodne misli korisnika.\n"
+        f"KARAKTER: Precizan, iskren, senior inženjer."
+    )
 
 async def call_ai(messages):
     global _groq_model
@@ -127,7 +133,7 @@ async def call_ai(messages):
         async with httpx.AsyncClient(timeout=40) as client:
             r = await client.post("https://api.groq.com/openai/v1/chat/completions", 
                                  headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, 
-                                 json={"model": GROQ_MODELS[0], "messages": messages, "temperature": 0.3})
+                                 json={"model": GROQ_MODELS[0], "messages": messages, "temperature": 0.4})
             if r.status_code == 200: 
                 _groq_model = GROQ_MODELS[0]
                 return r.json()["choices"][0]["message"]["content"], _groq_model
@@ -144,7 +150,7 @@ async def call_ai(messages):
     return "AI servisi nedostupni.", "ERROR"
 
 # ══════════════════════════════════════
-# UI - CIJELI ORIGINALNI HTML (Preko 600 linija)
+# UI - CIJELI ORIGINALNI HTML
 # ══════════════════════════════════════
 HTML = r"""<!DOCTYPE html>
 <html lang="hr">
@@ -283,7 +289,7 @@ body{background:var(--bg);color:var(--tx);font-family:'Syne',sans-serif;display:
 </header>
 <div class="mbar" id="mbar"></div>
 <div class="chat" id="chat">
-  <div class="msg"><div class="mm"><span class="mw atlas">Atlas</span></div><div>Sustav aktivan. Memorija ucitana. GitHub povezan.</div><div class="mt">BOOT · v15.0</div></div>
+  <div class="msg"><div class="mm"><span class="mw atlas">Atlas</span></div><div>Sustav aktivan. Memorija učitana. GitHub povezan.</div><div class="mt">BOOT · v15.0</div></div>
 </div>
 <div id="find">📎 <span id="fname"></span><span onclick="clrF()" style="cursor:pointer;color:var(--rd);margin-left:5px">✕</span></div>
 <div class="izone">
@@ -309,7 +315,7 @@ function rmTyp(){if(typEl){typEl.remove();typEl=null}}
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>'); }
 function ar(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,100)+'px'}
 function hk(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}}
-function send(){ const inp=document.getElementById('inp'); const txt=inp.value.trim(); if(!txt&&!pF)return; const chat=document.getElementById('chat'); const d=document.createElement('div');d.className='msg user'; const badge=pF?`<div class="fbg">📎 ${pF.name}</div>`:''; d.innerHTML=`<div class="mm"><span class="mw user">Ti</span></div>${badge}<div>${esc(txt)}</div>`; chat.appendChild(d);chat.scrollTop=chat.scrollHeight; showTyp(); ws.send(JSON.stringify({text:txt,file:pF,mediaMode:cMod})); inp.value='';inp.style.height='auto';clrF(); }
+function send(){ const inp=document.getElementById('inp'); const txt=inp.value.trim(); if(!txt&&!pF)return; const chat=document.getElementById('chat'); const d=document.createElement('div');d.className='msg user'; const badge=pF?`<div class="fbg">📎 ${pF.name}</div>`:''; d.innerHTML=`<div class="mm"><span class="mw user">Ti</span></div>${badge}<div>${esc(txt)}</div>`; chat.appendChild(d);chat.scrollTop=chat.scrollHeight; showTyp(); ws.send(JSON.stringify({text:txt,file:pF,mediaMode:cMod})); inp.value=''; inp.style.height='auto'; clrF(); }
 function onFile(input){ const file=input.files[0];if(!file)return; const reader=new FileReader(); reader.onload=e=>{ pF={name:file.name,type:file.type,data:e.target.result,isImage:file.type.startsWith('image/')}; document.getElementById('find').style.display='block'; document.getElementById('fname').textContent=file.name; }; if(file.type.startsWith('image/'))reader.readAsDataURL(file); else reader.readAsText(file); }
 function clrF(){pF=null;document.getElementById('find').style.display='none';document.getElementById('fi').value=''}
 function openSb(){document.getElementById('sb').classList.add('open');document.getElementById('ov').classList.add('on')}
