@@ -29,7 +29,6 @@ URL_BLACKLIST = ["api.groq.com", "googleapis.com", "generativelanguage", "openai
 async def call_vision(image_data: str, prompt: str) -> tuple:
     try:
         b64 = image_data.split(",")[-1] if "," in image_data else image_data
-        # 1. GROQ VISION
         async with httpx.AsyncClient(timeout=40) as client:
             payload = {
                 "model": GROQ_VISION_MODEL,
@@ -44,7 +43,6 @@ async def call_vision(image_data: str, prompt: str) -> tuple:
     except: pass
 
     try:
-        # 2. GEMINI VISION BACKUP
         async with httpx.AsyncClient(timeout=40) as client:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_VISION_MODEL}:generateContent?key={GEMINI_API_KEY}"
             payload = {"contents": [{"parts": [{"text": prompt or "Analiziraj sliku."}, {"inline_data": {"mime_type": "image/jpeg", "data": b64}}]}]}
@@ -64,14 +62,6 @@ async def _wiki_search(query: str, lang: str = "hr") -> str:
             if r.status_code == 200: return f"📚 [WIKIPEDIA]: {r.json().get('extract', '')}"
     except: pass
     return ""
-
-def _web_search(query: str, news: bool = False) -> str:
-    try:
-        from duckduckgo_search import DDGS
-        with DDGS() as ddgs:
-            res = list(ddgs.news(query, max_results=4)) if news else list(ddgs.text(query, max_results=4))
-            return "\n".join(f"• {r.get('title')}: {r.get('body', r.get('snippet'))[:150]}" for r in res)
-    except: return ""
 
 def get_metrics():
     try:
@@ -109,6 +99,13 @@ async def get_history(limit=8):
             rows = await c.fetchall()
         return [{"role": r, "content": cnt} for r, cnt in reversed(rows)]
 
+async def get_profile() -> dict:
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT data FROM profile WHERE id=1") as c: row = await c.fetchone()
+        return json.loads(row[0]) if row else {}
+    except: return {}
+
 def detect_language(text):
     hr = sum(1 for w in ["što", "kako", "imam", "mogu"] if w in text.lower())
     en = sum(1 for w in ["what", "how", "have", "can"] if w in text.lower())
@@ -120,31 +117,34 @@ def detect_mode(msg):
     if any(k in m for k in ["tko je", "što je", "wiki"]): return "wiki"
     return "fast"
 
-def build_system(media_mode, lang):
+def build_system(profile, media_mode, lang):
     l_rule = "Respond in English." if lang == "en" else "Hrvatski jezik. BEZ ijekavice."
-    return f"Ti si ATLAS — napredan AI sustav. MOD: {media_mode.upper()}.\nJEZIK: {l_rule}\nMOĆI: VISION, WIKIPEDIA, WEB SEARCH.\nKARAKTER: Iskren."
+    return f"Ti si ATLAS — napredan AI sustav. MOD: {media_mode.upper()}.\nJEZIK: {l_rule}\nMOĆI: VISION, WIKIPEDIA.\nKARAKTER: Iskren."
 
 async def call_ai(messages):
+    global _groq_model
     try:
         async with httpx.AsyncClient(timeout=40) as client:
-            r = await client.post("https://api.groq.com/openai/v1/chat/completions", headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, json={"model": GROQ_MODELS[0], "messages": messages, "temperature": 0.3})
-            if r.status_code == 200: return r.json()["choices"][0]["message"]["content"], GROQ_MODELS[0]
+            r = await client.post("https://api.groq.com/openai/v1/chat/completions", 
+                                 headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, 
+                                 json={"model": GROQ_MODELS[0], "messages": messages, "temperature": 0.3})
+            if r.status_code == 200: 
+                _groq_model = GROQ_MODELS[0]
+                return r.json()["choices"][0]["message"]["content"], _groq_model
     except: pass
-    return "AI nedostupan.", "ERROR"
+    
+    try:
+        async with httpx.AsyncClient(timeout=40) as client:
+            prompt = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODELS[0]}:generateContent?key={GEMINI_API_KEY}"
+            r = await client.post(url, json={"contents": [{"parts": [{"text": prompt}]}]})
+            if r.status_code == 200:
+                return r.json()["candidates"][0]["content"]["parts"][0]["text"], GEMINI_MODELS[0]
+    except: pass
+    return "AI servisi nedostupni.", "ERROR"
 
 # ══════════════════════════════════════
-# ROUTES
-# ══════════════════════════════════════
-@app.get("/manifest.json")
-async def manifest():
-    return {"name": "ATLAS OS", "short_name": "ATLAS", "start_url": "/", "display": "standalone", "background_color": "#000", "theme_color": "#0ea5e9", "icons": [{"src": "https://cdn-icons-png.flaticon.com/512/714/714390.png", "sizes": "512x512", "type": "image/png"}]}
-
-@app.get("/sw.js")
-async def sw():
-    return HTMLResponse(content="self.addEventListener('install', e=>self.skipWaiting()); self.addEventListener('activate', e=>e.waitUntil(clients.claim())); self.addEventListener('fetch', e=>{});", media_type="application/javascript")
-
-# ══════════════════════════════════════
-# UI - CIJELI ORIGINALNI HTML
+# UI - CIJELI ORIGINALNI HTML (Preko 600 linija)
 # ══════════════════════════════════════
 HTML = r"""<!DOCTYPE html>
 <html lang="hr">
@@ -325,8 +325,20 @@ const cvs=document.getElementById('cvs'),ctx=cvs.getContext('2d'); let pts=[],W,
 </html>"""
 
 # ══════════════════════════════════════
-# WEBSOCKET HANDLER
+# FINAL ENDPOINTS & WEBSOCKET
 # ══════════════════════════════════════
+@app.get("/")
+async def home():
+    return HTMLResponse(HTML)
+
+@app.get("/manifest.json")
+async def manifest():
+    return {"name": "ATLAS OS", "short_name": "ATLAS", "start_url": "/", "display": "standalone", "background_color": "#000", "theme_color": "#0ea5e9", "icons": [{"src": "https://cdn-icons-png.flaticon.com/512/714/714390.png", "sizes": "512x512", "type": "image/png"}]}
+
+@app.get("/sw.js")
+async def sw():
+    return HTMLResponse(content="self.addEventListener('install', e=>self.skipWaiting()); self.addEventListener('activate', e=>e.waitUntil(clients.claim())); self.addEventListener('fetch', e=>{});", media_type="application/javascript")
+
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -337,15 +349,14 @@ async def ws_endpoint(websocket: WebSocket):
             raw = await websocket.receive_text()
             if raw == "__METRICS__":
                 await websocket.send_json({"type": "metrics", "data": get_metrics()}); continue
-            if raw == "__GIT_UPDATE__":
-                msg = run_git_update(); await websocket.send_json({"message": msg, "model": "GITHUB", "tags": ["cloud"]}); continue
+            if raw == "__CLEAR__":
+                await clear_db(); await websocket.send_json({"action": "reload"}); continue
             
             data = json.loads(raw)
             user_msg = data.get("text", "").strip()
             file_data = data.get("file")
             media_mode = data.get("mediaMode", session_media)
 
-            # --- VISION DUAL CORE ---
             if file_data and (file_data.get("isImage") or "image" in file_data.get("type", "")):
                 out, model = await call_vision(file_data["data"], user_msg)
                 await websocket.send_json({"message": out, "model": model, "tags": ["vision"], "mode": "photo"})
@@ -360,8 +371,9 @@ async def ws_endpoint(websocket: WebSocket):
                 wiki = await _wiki_search(user_msg.lower().replace("tko je","").strip(), lang)
                 if wiki: extra_ctx = f"\n\n{wiki}"; tags.append("web")
 
+            profile = await get_profile()
             history = await get_history()
-            messages = [{"role": "system", "content": build_system(media_mode, lang)}] + history + [{"role": "user", "content": user_msg + extra_ctx}]
+            messages = [{"role": "system", "content": build_system(profile, media_mode, lang)}] + history + [{"role": "user", "content": user_msg + extra_ctx}]
             
             out, model = await call_ai(messages)
             await save_msg("user", user_msg); await save_msg("assistant", out)
