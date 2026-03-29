@@ -1,0 +1,96 @@
+{
+    "last_backup": "2026-03-29T16:02:52.900040",
+    "total_files": 15,
+    "projects": [
+        {
+            "name": "main.py",
+            "path": "./main.py",
+            "size": 33815,
+            "last_modified": "2026-03-29T15:58:58.426771"
+        },
+        {
+            "name": "database.db",
+            "path": "./database.db",
+            "size": 638976,
+            "last_modified": "2026-03-29T16:02:45.610771"
+        },
+        {
+            "name": "start_atlas.sh",
+            "path": "./start_atlas.sh",
+            "size": 92,
+            "last_modified": "2026-03-27T23:53:14.556650"
+        },
+        {
+            "name": "requirements.txt",
+            "path": "./requirements.txt",
+            "size": 36,
+            "last_modified": "2026-03-27T19:10:35.264756"
+        },
+        {
+            "name": "README.md",
+            "path": "./README.md",
+            "size": 1234,
+            "last_modified": "2026-03-27T19:10:51.584756"
+        },
+        {
+            "name": "LICENSE",
+            "path": "./LICENSE",
+            "size": 1073,
+            "last_modified": "2026-03-27T19:11:50.420756"
+        },
+        {
+            "name": "cloud_backup.py",
+            "path": "./cloud_backup.py",
+            "size": 2306,
+            "last_modified": "2026-03-27T23:34:00.798556"
+        },
+        {
+            "name": "search_module.py",
+            "path": "./search_module.py",
+            "size": 685,
+            "last_modified": "2026-03-27T21:27:38.775009"
+        },
+        {
+            "name": "atlas_core.py",
+            "path": "./atlas_core.py",
+            "size": 3093,
+            "last_modified": "2026-03-27T21:46:15.795009"
+        },
+        {
+            "name": "Screenshot_20260328_111319_Samsung Internet.jpg",
+            "path": "./Screenshot_20260328_111319_Samsung Internet.jpg",
+            "size": 321812,
+            "last_modified": "2026-03-28T13:24:46.689992"
+        },
+        {
+            "name": "Screenshot_20260328_152624_Samsung Internet.jpg",
+            "path": "./Screenshot_20260328_152624_Samsung Internet.jpg",
+            "size": 473793,
+            "last_modified": "2026-03-28T18:11:24.433314"
+        },
+        {
+            "name": "atlas_core.db",
+            "path": "./atlas_core.db",
+            "size": 57344,
+            "last_modified": "2026-03-28T20:37:12.933656"
+        },
+        {
+            "name": "auto_healer.py",
+            "path": "./backend/auto_healer.py",
+            "size": 1410,
+            "last_modified": "2026-03-26T12:58:33.219391"
+        },
+        {
+            "name": "science.py",
+            "path": "./backend/science.py",
+            "size": 965,
+            "last_modified": "2026-03-26T19:45:33.714591"
+        },
+        {
+            "name": "research.py",
+            "path": "./backend/research.py",
+            "size": 705,
+            "last_modified": "2026-03-26T18:21:05.254591"
+        }
+    ]
+}
