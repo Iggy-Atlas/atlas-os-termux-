@@ -1,7 +1,7 @@
-import os, uvicorn, httpx, json, asyncio, subprocess, re, base64
+import os, uvicorn, httpx, json, asyncio, subprocess, re, base64, io
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from dotenv import load_dotenv
 import aiosqlite
 
@@ -12,75 +12,55 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 app = FastAPI()
 DB_PATH = "database.db"
 
-# ══════════════════════════════════════
-# MODEL REGISTRY
-# ══════════════════════════════════════
-GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768", "gemma2-9b-it"]
-GEMINI_MODELS = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.0-flash-lite", "gemini-flash-latest"]
-GROQ_VISION_MODEL = "llama-3.2-11b-vision-preview"
-GEMINI_VISION_MODEL = "gemini-1.5-flash"
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-70b-versatile",
+    "llama-3.1-8b-instant",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
+]
+GEMINI_MODELS = [
+    "gemini-2.0-flash",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-flash-latest",
+]
+GROQ_VISION_MODELS = [
+    "llama-3.2-11b-vision-preview",
+    "llama-3.2-90b-vision-preview",
+]
 
-_groq_model, _gemini_model = None, None
-URL_BLACKLIST = ["api.groq.com", "googleapis.com", "generativelanguage", "openai.com", "fonts.googleapis", "cdnjs.cloudflare", "anthropic.com", "localhost", "127.0.0.1", "0.0.0.0"]
+_groq_model   = None
+_gemini_model = None
+_vision_model = None
 
-# ══════════════════════════════════════
-# ENGINES: VISION (Dual Core Bypass)
-# ══════════════════════════════════════
-async def call_vision(image_data: str, prompt: str) -> tuple:
+URL_BLACKLIST = [
+    "api.groq.com", "googleapis.com", "generativelanguage",
+    "openai.com", "fonts.googleapis", "cdnjs.cloudflare",
+    "anthropic.com", "127.0.0.1", "0.0.0.0", "localhost",
+    "shields.io", "flaticon.com", "github.com/login",
+]
+
+def get_metrics() -> dict:
+    bat = "N/A"
     try:
-        b64 = image_data.split(",")[-1] if "," in image_data else image_data
-        async with httpx.AsyncClient(timeout=40) as client:
-            payload = {
-                "model": GROQ_VISION_MODEL,
-                "messages": [{"role": "user", "content": [
-                    {"type": "text", "text": prompt or "Opiši sliku detaljno."},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                ]}],
-                "max_tokens": 1024
-            }
-            r = await client.post("https://api.groq.com/openai/v1/chat/completions", headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, json=payload)
-            if r.status_code == 200: return r.json()["choices"][0]["message"]["content"], "GROQ VISION"
-    except: pass
-
+        r = subprocess.run(["termux-battery-status"], capture_output=True, text=True, timeout=2)
+        if r.returncode == 0:
+            b = json.loads(r.stdout)
+            icon = "⚡" if b.get("status") != "DISCHARGING" else "🔋"
+            bat = f"{icon}{b.get('percentage', 0)}%"
+    except:
+        pass
+    mem = "N/A"
     try:
-        async with httpx.AsyncClient(timeout=40) as client:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_VISION_MODEL}:generateContent?key={GEMINI_API_KEY}"
-            payload = {"contents": [{"parts": [{"text": prompt or "Analiziraj sliku."}, {"inline_data": {"mime_type": "image/jpeg", "data": b64}}]}]}
-            r = await client.post(url, json=payload)
-            if r.status_code == 200: return r.json()["candidates"][0]["content"]["parts"][0]["text"], "GEMINI VISION"
-    except: pass
-    return "Vision senzori nedostupni (API Limit).", "ERROR"
-
-# ══════════════════════════════════════
-# CORE FUNCTIONS
-# ══════════════════════════════════════
-async def _wiki_search(query: str, lang: str = "hr") -> str:
-    url = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{query.replace(' ', '_')}"
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url)
-            if r.status_code == 200: return f"📚 [WIKIPEDIA]: {r.json().get('extract', '')}"
-    except: pass
-    return ""
-
-def get_metrics():
-    try:
-        bat_res = subprocess.run(["termux-battery-status"], capture_output=True, text=True, timeout=1)
-        bat_str = "N/A"
-        if bat_res.returncode == 0:
-            b = json.loads(bat_res.stdout)
-            bat_str = f"{'⚡' if b.get('status') != 'DISCHARGING' else '🔋'}{b.get('percentage', 0)}"
-        mem_res = subprocess.run(["free", "-m"], capture_output=True, text=True)
-        mem_info = mem_res.stdout.split('\n')[1].split()
-        mem_p = round((int(mem_info[2]) / int(mem_info[1])) * 100, 1)
-        return {"cpu": bat_str, "mem": mem_p}
-    except: return {"cpu": "!", "mem": "!"}
-
-def run_git_update():
-    try:
-        subprocess.run(["git", "pull"], check=True, timeout=60)
-        return "✅ Ažurirano. Restartaj Atlas."
-    except: return "❌ Greška ažuriranja."
+        with open("/proc/meminfo") as f:
+            lines = f.readlines()
+        mt = int(lines[0].split()[1])
+        ma = int(lines[2].split()[1])
+        mem = round((1 - ma / mt) * 100, 1)
+    except:
+        pass
+    return {"cpu": bat, "mem": mem}
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -88,70 +68,299 @@ async def init_db():
         await db.execute("CREATE TABLE IF NOT EXISTS profile (id INTEGER PRIMARY KEY, data TEXT)")
         await db.commit()
 
-async def save_msg(role, content):
+async def save_msg(role: str, content: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO memory (role, content, timestamp) VALUES (?,?,?)", (role, str(content)[:500], str(datetime.now())))
+        await db.execute("INSERT INTO memory (role, content, timestamp) VALUES (?,?,?)", (role, str(content)[:600], str(datetime.now())))
+        await db.execute("DELETE FROM memory WHERE id NOT IN (SELECT id FROM memory ORDER BY id DESC LIMIT 40)")
         await db.commit()
 
-async def get_history(limit=20): # POVEĆAN LIMIT MEMORIJE ZA BOLJI KONTEKST
+async def get_history(limit: int = 10) -> list:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT role, content FROM memory ORDER BY id DESC LIMIT ?", (limit,)) as c:
             rows = await c.fetchall()
-        return [{"role": r, "content": cnt} for r, cnt in reversed(rows)]
+    return [{"role": r, "content": cnt} for r, cnt in reversed(rows)]
+
+async def clear_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM memory")
+        await db.commit()
+
+def count_tokens(messages: list) -> int:
+    return sum(len(str(m.get("content", ""))) for m in messages) // 4
+
+def trim_messages(messages: list, limit: int = 4500) -> list:
+    if count_tokens(messages) <= limit:
+        return messages
+    system  = [m for m in messages if m["role"] == "system"]
+    rest    = [m for m in messages if m["role"] != "system"]
+    last    = rest[-1:] if rest else []
+    history = rest[:-1]
+    while history and count_tokens(system + history + last) > limit:
+        history = history[2:]
+    print(f"[TOKENS] ~{count_tokens(system + history + last)} tokena")
+    return system + history + last
+
+PROFILE_TRIGGERS = ["zovem se", "moje ime", "radim na", "volim", "preferiram", "projekt", "koristim", "my name", "i am", "i work", "i like"]
+
+async def update_profile(user_msg: str):
+    if not any(k in user_msg.lower() for k in PROFILE_TRIGGERS):
+        return
+    try:
+        model = _groq_model or GROQ_MODELS[0]
+        prompt = f'Extract user info as JSON only. Schema: {{"name":"","preferences":[],"projects":[]}} Message: {user_msg[:300]}'
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post("https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={"model": model, "max_tokens": 150, "temperature": 0.1, "messages": [{"role": "user", "content": prompt}]})
+            if r.status_code != 200: return
+            raw = re.sub(r"```json?", "", r.json()["choices"][0]["message"]["content"]).replace("```","").strip()
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("INSERT OR REPLACE INTO profile VALUES (1,?)", (json.dumps(json.loads(raw)),))
+                await db.commit()
+    except Exception as e:
+        print(f"[PROFILE] {e}")
 
 async def get_profile() -> dict:
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT data FROM profile WHERE id=1") as c: row = await c.fetchone()
+            async with db.execute("SELECT data FROM profile WHERE id=1") as c:
+                row = await c.fetchone()
         return json.loads(row[0]) if row else {}
-    except: return {}
+    except:
+        return {}
 
-def detect_language(text):
-    hr = sum(1 for w in ["što", "kako", "imam", "mogu", "ovdje"] if w in text.lower())
-    en = sum(1 for w in ["what", "how", "have", "can", "here"] if w in text.lower())
-    return "en" if en > hr else "hr"
+def detect_language(text: str) -> str:
+    t = text.lower()
+    scores = {
+        "hr": sum(1 for w in ["što","kako","zašto","gdje","kada","imam","treba","mogu","ovo","nije","da","ali","jer","sam","koji"] if w in t.split()),
+        "en": sum(1 for w in ["what","how","why","where","when","have","need","can","this","that","the","and","for","is","are"] if w in t.split()),
+        "de": sum(1 for w in ["was","wie","warum","wo","ich","habe","kann","das","und","ist"] if w in t.split()),
+        "fr": sum(1 for w in ["que","comment","pourquoi","je","avoir","peut","est","les","des"] if w in t.split()),
+        "es": sum(1 for w in ["que","como","por","yo","tengo","puede","los","una","para"] if w in t.split()),
+    }
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else "hr"
 
-def detect_mode(msg):
+def detect_mode(msg: str) -> str:
     m = msg.lower()
-    if any(k in m for k in ["kod", "python", "code"]): return "code"
-    if any(k in m for k in ["tko je", "što je", "wiki"]): return "wiki"
+    if re.search(r'https?://', m): return "url"
+    if any(k in m for k in ["bug","error","greška","kod","debug","fix","python","script","funkcij","code"]): return "code"
+    if any(k in m for k in ["zašto","objasni","analiziraj","usporedi","razlika","kako radi","sto je","analyze","explain","compare"]): return "analysis"
+    if any(k in m for k in ["ideja","napravi","smisli","kreativan","prijedlog","osmisli","create","design","imagine"]): return "creative"
+    if any(k in m for k in ["vijesti","danas","pretrazi","tko je","ko je","cijena","trenutno","news","search","today"]): return "search"
     return "fast"
 
-def build_system(profile, media_mode, lang):
-    # UKLONJENA IJEKAVICA - UNIVERZALNA JEZIČNA SPOSOBNOST
-    l_rule = "Respond in English." if lang == "en" else "Hrvatski književni jezik."
+def extract_urls(text: str) -> list:
+    found = re.findall(r'https?://[^\s<>"{}|\\^`\[\]]+', text)
+    return [u for u in found if not any(b in u for b in URL_BLACKLIST)]
+
+async def fetch_url_content(url: str) -> tuple:
+    headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36", "Accept": "text/html,application/xhtml+xml,application/pdf,*/*;q=0.9"}
+    try:
+        async with httpx.AsyncClient(timeout=25, follow_redirects=True, verify=False) as client:
+            r = await client.get(url, headers=headers)
+            ct = r.headers.get("content-type", "").lower()
+            if "pdf" in ct or url.lower().endswith(".pdf"):
+                return _parse_pdf(r.content), "pdf"
+            if "json" in ct:
+                try: return json.dumps(r.json(), indent=2, ensure_ascii=False)[:3000], "json"
+                except: return r.text[:3000], "json"
+            html = r.text
+            for pat in [r'<script[^>]*>.*?</script>', r'<style[^>]*>.*?</style>', r'<nav[^>]*>.*?</nav>', r'<footer[^>]*>.*?</footer>', r'<header[^>]*>.*?</header>', r'<!--.*?-->']:
+                html = re.sub(pat, '', html, flags=re.DOTALL|re.IGNORECASE)
+            html = re.sub(r'<[^>]+>', ' ', html)
+            html = re.sub(r'&[a-zA-Z]+;', ' ', html)
+            html = re.sub(r'\s+', ' ', html).strip()
+            return html[:4000], "web"
+    except httpx.TimeoutException: return "[Timeout — stranica ne reagira]", "error"
+    except httpx.ConnectError: return "[Greska veze — stranica nedostupna]", "error"
+    except Exception as e: return f"[Greska: {str(e)[:120]}]", "error"
+
+def _parse_pdf(content: bytes) -> str:
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(io.BytesIO(content))
+        text = ""
+        for i, page in enumerate(reader.pages[:12]):
+            text += f"\n--- Str. {i+1} ---\n{page.extract_text() or ''}"
+        return f"[PDF — {len(reader.pages)} stranica]\n{text[:5000]}"
+    except ImportError:
+        try:
+            raw = content.decode("latin-1", errors="ignore")
+            chunks = re.findall(r'BT\s*(.*?)\s*ET', raw, re.DOTALL)
+            texts = [p for c in chunks for p in re.findall(r'\((.*?)\)', c)]
+            result = " ".join(texts)
+            if result: return f"[PDF parcijalno]\n{result[:4000]}"
+        except: pass
+        return "[PDF ucitan. Instaliraj: pip install pypdf]"
+    except Exception as e: return f"[PDF greska: {str(e)[:100]}]"
+
+def _parse_file(name: str, content: str) -> str:
+    ext = name.lower().split(".")[-1] if "." in name else ""
+    if ext == "pdf":
+        try:
+            raw = base64.b64decode(content.split(",")[1] if "," in content else content)
+            return _parse_pdf(raw)
+        except Exception as e: return f"[PDF greska: {e}]"
+    if ext == "csv": return f"[CSV]\n" + "\n".join(content.split("\n")[:50])
+    if ext == "json":
+        try: return f"[JSON]\n{json.dumps(json.loads(content), indent=2, ensure_ascii=False)[:3000]}"
+        except: pass
+    return f"[Fajl: {name}]\n{content[:3000]}"
+
+def _web_search(query: str, news: bool = False) -> str:
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            if news:
+                results = list(ddgs.news(query, max_results=5))
+                return "\n".join(f"• [{r.get('date','')[:10]}] {r['title']}: {r.get('body','')[:200]}" for r in results)
+            results = list(ddgs.text(query, max_results=5))
+            return "\n".join(f"• {r['title']}: {r['body'][:200]}" for r in results)
+    except Exception as e:
+        print(f"[SEARCH] {e}")
+        return ""
+
+def run_backup(filepath: str = "") -> str:
+    try:
+        if filepath:
+            fp = filepath.strip().strip("'\"")
+            if not os.path.isabs(fp):
+                fp = os.path.join(os.path.expanduser("~"), "atlas_os_v1", fp)
+            if os.path.exists(fp):
+                result = subprocess.run(["rclone", "copy", fp, "remote:AtlasBackup/", "-v"], capture_output=True, text=True, timeout=120)
+                return f"Fajl prenesen: {os.path.basename(fp)}" if result.returncode == 0 else f"rclone greska: {result.stderr[:200]}"
+            return f"Fajl nije pronaden: {fp}"
+        result = subprocess.run(["python", "cloud_backup.py"], capture_output=True, text=True, timeout=120)
+        return "Backup zavrsen — Google Cloud sinkroniziran." if result.returncode == 0 else f"Backup greska: {result.stderr[:200]}"
+    except FileNotFoundError: return "rclone nije instaliran. Instaliraj: pkg install rclone"
+    except subprocess.TimeoutExpired: return "Backup traje predugo."
+    except Exception as e: return f"Backup greska: {str(e)[:100]}"
+
+def _detect_backup_file(msg: str) -> str:
+    for p in [r'prenesi\s+["\']?(.+?)["\']?\s+na\s+oblak', r'upload\s+["\']?(.+?)["\']?\s+(?:na|to)\s+(?:oblak|cloud)', r'spremi\s+["\']?(.+?)["\']?\s+na\s+oblak']:
+        m = re.search(p, msg.lower())
+        if m: return m.group(1).strip()
+    return ""
+
+def run_git_update() -> str:
+    try:
+        result = subprocess.run(["git", "pull"], capture_output=True, text=True, timeout=60)
+        return f"GitHub azuriranje uspjesno.\n{result.stdout[:300]}\nRestartaj Atlas." if result.returncode == 0 else f"Git greska:\n{result.stderr[:300]}"
+    except Exception as e: return f"Git greska: {e}"
+
+LANG_RULES = {
+    "hr": "Jezik: standardni hrvatski knjizevni. STROGO bez ijekavice. Pravilno: 'ne','je','bel','mleko','dete'. Gramaticki ispravno.",
+    "en": "Language: fluent, natural English.",
+    "de": "Sprache: fließendes, natürliches Deutsch.",
+    "fr": "Langue: français courant et naturel.",
+    "es": "Idioma: español fluido y natural.",
+}
+MODE_INSTRUCTIONS = {
+    "code":     "Samo kod + kratko objasnjenje.",
+    "analysis": "Korak po korak. Jasan zakljucak.",
+    "creative": "Originalno. Izbjegavaj kliseje.",
+    "search":   "Konkretno. Koristi web podatke.",
+    "url":      "Analiziraj ucitani sadrzaj. Kljucne tocke.",
+    "fast":     "Direktno i kratko.",
+    "video":    "Strucnjak za video produkciju.",
+    "audio":    "Strucnjak za audio i glazbu.",
+    "photo":    "Strucnjak za fotografiju i obradu slika.",
+}
+
+def build_system(profile: dict, mode: str, lang: str, media_mode: str) -> str:
+    name = profile.get("name",""); prefs = profile.get("preferences",[]); projects = profile.get("projects",[])
+    user_ctx = ""
+    if name: user_ctx += f"Korisnik: {name}. "
+    if prefs: user_ctx += f"Interesi: {', '.join(prefs[:4])}. "
+    if projects: user_ctx += f"Projekti: {', '.join(projects[:3])}. "
+    media_ctx = f" MULTIMEDIJSKI MOD: {media_mode.upper()}." if media_mode != "text" else ""
     return (
-        f"Ti si ATLAS — vrhunski AI sustav. MOD: {media_mode.upper()}.\n"
-        f"JEZIK: {l_rule} Budi spreman tečno komunicirati na bilo kojem književnom jeziku.\n"
-        f"ZADATAK: Analiziraj povijest razgovora i nadovezuj se na prethodne misli korisnika.\n"
-        f"KARAKTER: Precizan, iskren, senior inženjer."
+        f"Ti si ATLAS — napredni AI operativni sustav.{media_ctx}\n"
+        f"MOD: {mode.upper()} — {MODE_INSTRUCTIONS.get(mode, MODE_INSTRUCTIONS['fast'])}\n"
+        f"{LANG_RULES.get(lang, LANG_RULES['hr'])}\n"
+        f"KARAKTER: Direktan. Iskren. Bez laskanja. Bez 'Naravno!' i slicnih fraza. Ako korisnik grjesi reci mu konstruktivno.\n"
+        f"SPOSOBNOSTI: Citas URL-ove i PDF-ove. Web pretraga. Google Cloud backup. Pamtis razgovor.\n"
+        + (f"PROFIL: {user_ctx}\n" if user_ctx else "")
+        + "Kod u blokovima. Tablice u markdown formatu."
     )
 
-async def call_ai(messages):
+async def call_groq(messages: list, temp: float) -> str | None:
     global _groq_model
-    try:
-        async with httpx.AsyncClient(timeout=40) as client:
-            r = await client.post("https://api.groq.com/openai/v1/chat/completions", 
-                                 headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, 
-                                 json={"model": GROQ_MODELS[0], "messages": messages, "temperature": 0.4})
-            if r.status_code == 200: 
-                _groq_model = GROQ_MODELS[0]
-                return r.json()["choices"][0]["message"]["content"], _groq_model
-    except: pass
-    
-    try:
-        async with httpx.AsyncClient(timeout=40) as client:
-            prompt = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODELS[0]}:generateContent?key={GEMINI_API_KEY}"
-            r = await client.post(url, json={"contents": [{"parts": [{"text": prompt}]}]})
-            if r.status_code == 200:
-                return r.json()["candidates"][0]["content"]["parts"][0]["text"], GEMINI_MODELS[0]
-    except: pass
-    return "AI servisi nedostupni.", "ERROR"
+    messages = trim_messages(messages, 4500)
+    order = ([_groq_model] + [m for m in GROQ_MODELS if m != _groq_model] if _groq_model else GROQ_MODELS)
+    async with httpx.AsyncClient(timeout=45) as client:
+        for model in order:
+            try:
+                r = await client.post("https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json={"model": model, "messages": messages, "temperature": temp, "max_tokens": 1000})
+                if r.status_code == 200:
+                    if _groq_model != model: print(f"[GROQ] Aktivan: {model}"); _groq_model = model
+                    return r.json()["choices"][0]["message"]["content"]
+                if r.status_code == 413:
+                    messages = trim_messages(messages, 2500)
+                    r2 = await client.post("https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                        json={"model": model, "messages": messages, "temperature": temp, "max_tokens": 700})
+                    if r2.status_code == 200: _groq_model = model; return r2.json()["choices"][0]["message"]["content"]
+                if r.status_code == 429: print(f"[GROQ] {model} rate limit"); continue
+                print(f"[GROQ] {model} — {r.status_code}")
+            except Exception as e: print(f"[GROQ] {model}: {e}"); continue
+    _groq_model = None
+    return None
 
-# ══════════════════════════════════════
-# UI - CIJELI ORIGINALNI HTML
-# ══════════════════════════════════════
+async def call_gemini(messages: list) -> str | None:
+    global _gemini_model
+    prompt = "\n".join(f"{'ATLAS' if m['role']=='assistant' else 'KORISNIK'}: {m['content']}" for m in messages if isinstance(m.get("content"),str))
+    if len(prompt) > 18000: prompt = prompt[-18000:]
+    order = ([_gemini_model] + [m for m in GEMINI_MODELS if m != _gemini_model] if _gemini_model else GEMINI_MODELS)
+    async with httpx.AsyncClient(timeout=45) as client:
+        for model in order:
+            try:
+                r = await client.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}",
+                    json={"contents": [{"parts": [{"text": prompt}]}]})
+                if r.status_code == 200:
+                    if _gemini_model != model: print(f"[GEMINI] Aktivan: {model}"); _gemini_model = model
+                    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                if r.status_code == 429: print(f"[GEMINI] {model} quota"); continue
+                print(f"[GEMINI] {model} — {r.status_code}")
+            except Exception as e: print(f"[GEMINI] {model}: {e}"); continue
+    _gemini_model = None
+    return None
+
+async def call_ai(messages: list, mode: str = "fast") -> tuple:
+    temp = {"fast":0.35,"analysis":0.2,"creative":0.75,"code":0.1,"search":0.3,"url":0.2,"video":0.3,"audio":0.3,"photo":0.3}.get(mode,0.35)
+    out = await call_groq(messages, temp)
+    if out: return out, _groq_model or "GROQ"
+    print("[ATLAS] Groq nedostupan → Gemini")
+    out = await call_gemini(messages)
+    if out: return out, _gemini_model or "GEMINI"
+    return "Oba AI servisa trenutno nedostupna.", "ERROR"
+
+async def call_vision(image_data: str, prompt: str) -> tuple:
+    global _vision_model
+    b64 = image_data.split(",")[-1] if "," in image_data else image_data
+    order = ([_vision_model] + [m for m in GROQ_VISION_MODELS if m != _vision_model] if _vision_model else GROQ_VISION_MODELS)
+    async with httpx.AsyncClient(timeout=40) as client:
+        for model in order:
+            try:
+                r = await client.post("https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json={"model": model, "max_tokens": 900, "temperature": 0.2,
+                          "messages": [{"role":"user","content":[{"type":"text","text":prompt or "Analiziraj ovu sliku detaljno."},{"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}]}]})
+                if r.status_code == 200: _vision_model = model; return r.json()["choices"][0]["message"]["content"], "GROQ VISION"
+                print(f"[VISION] {model} — {r.status_code}")
+            except Exception as e: print(f"[VISION] {model}: {e}")
+    try:
+        gem = _gemini_model or GEMINI_MODELS[0]
+        async with httpx.AsyncClient(timeout=40) as client:
+            r = await client.post(f"https://generativelanguage.googleapis.com/v1beta/models/{gem}:generateContent?key={GEMINI_API_KEY}",
+                json={"contents":[{"parts":[{"text":prompt or "Analiziraj ovu sliku."},{"inline_data":{"mime_type":"image/jpeg","data":b64}}]}]})
+            if r.status_code == 200: return r.json()["candidates"][0]["content"]["parts"][0]["text"], "GEMINI VISION"
+    except Exception as e: print(f"[VISION GEMINI]: {e}")
+    return "Vision analiza nedostupna.", "ERROR"
+
 HTML = r"""<!DOCTYPE html>
 <html lang="hr">
 <head>
@@ -165,7 +374,7 @@ HTML = r"""<!DOCTYPE html>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 body{background:var(--bg);color:var(--tx);font-family:'Syne',sans-serif;display:flex;flex-direction:column;height:100dvh;overflow:hidden;position:fixed;width:100%}
 #cvs{position:fixed;inset:0;z-index:0;pointer-events:auto}
-.sb{position:fixed;top:0;left:0;width:265px;height:100%;background:rgba(4,8,18,.98);border-right:1px solid var(--br);z-index:200;transform:translateX(-100%);transition:transform .26s cubic-bezier(.4,0,.2,1);display:flex;flex-direction:column;backdrop-filter:blur(20px)}
+.sb{position:fixed;top:0;left:0;width:268px;height:100%;background:rgba(4,8,18,.98);border-right:1px solid var(--br);z-index:200;transform:translateX(-100%);transition:transform .26s cubic-bezier(.4,0,.2,1);display:flex;flex-direction:column;backdrop-filter:blur(20px)}
 .sb.open{transform:translateX(0)}
 .sb-hd{padding:26px 16px 12px;border-bottom:1px solid var(--br)}
 .sb-logo{font-family:'Orbitron';color:var(--acc);font-size:19px;letter-spacing:.12em;text-shadow:0 0 14px rgba(14,165,233,.5)}
@@ -186,9 +395,9 @@ body{background:var(--bg);color:var(--tx);font-family:'Syne',sans-serif;display:
 .hdr{padding:10px 13px;background:rgba(0,0,0,.9);border-bottom:1px solid var(--br);display:flex;align-items:center;gap:9px;z-index:10;flex-shrink:0;backdrop-filter:blur(12px)}
 .hdr-logo{font-family:'Orbitron';color:var(--acc);font-size:12px;letter-spacing:.1em;text-shadow:0 0 10px rgba(14,165,233,.4);line-height:1.2}
 .hdr-sub{font-size:9px;color:var(--mu);letter-spacing:.05em}
-.met{font-family:'Orbitron';font-size:9px;color:var(--mu);letter-spacing:.05em}
+.met{font-family:'Orbitron';font-size:9px;color:var(--mu);letter-spacing:.05em;white-space:nowrap}
 .met span{color:var(--acc)}
-.hdr-r{margin-left:auto;display:flex;align-items:center;gap:6px}
+.hdr-r{margin-left:auto;display:flex;align-items:center;gap:6px;flex-shrink:0}
 .mpill{font-size:8px;padding:2px 6px;border-radius:3px;border:1px solid var(--br);color:var(--mu);letter-spacing:.06em;transition:all .3s}
 .mpill.groq{border-color:rgba(14,165,233,.4);color:var(--acc)}
 .mpill.gemini{border-color:rgba(251,191,36,.4);color:var(--yw)}
@@ -204,7 +413,7 @@ body{background:var(--bg);color:var(--tx);font-family:'Syne',sans-serif;display:
 .mbar{display:none;padding:7px 11px;background:rgba(0,0,0,.75);border-bottom:1px solid var(--br);gap:7px;z-index:9;flex-shrink:0;backdrop-filter:blur(8px);overflow-x:auto}
 .mbar.show{display:flex}
 .mbar::-webkit-scrollbar{height:2px}
-.mbtn{display:flex;align-items:center;gap:5px;padding:6px 11px;border-radius:7px;border:1px solid var(--br);background:rgba(255,255,255,.02);color:var(--mu);font-size:11px;cursor:pointer;white-space:nowrap;transition:all .13s;font-family:'Syne'}
+.mbtn{display:flex;align-items:center;gap:5px;padding:6px 11px;border-radius:7px;border:1px solid var(--br);background:rgba(255,255,255,.02);color:var(--mu);font-size:11px;cursor:pointer;white-space:nowrap;transition:all .13s;font-family:'Syne',sans-serif}
 .mbtn:hover{border-color:var(--acc);color:var(--tx)}
 .mbar.video .mbtn:hover{border-color:var(--vd);color:var(--vd)}
 .mbar.audio .mbtn:hover{border-color:var(--au);color:var(--au)}
@@ -256,31 +465,25 @@ body{background:var(--bg);color:var(--tx);font-family:'Syne',sans-serif;display:
 <canvas id="cvs"></canvas>
 <div class="ov" id="ov" onclick="closeSb()"></div>
 <aside class="sb" id="sb">
-  <div class="sb-hd">
-    <div class="sb-logo">ATLAS</div>
-    <div class="sb-sub">OS v15.0 · IMAGO</div>
-  </div>
+  <div class="sb-hd"><div class="sb-logo">ATLAS</div><div class="sb-sub">OS v16.0 · IMAGO</div></div>
   <div class="sb-bd">
     <div class="sb-sec">Sesija</div>
     <div class="si" onclick="newSess()">✦ &nbsp;Nova sesija</div>
-    <div class="si" onclick="doBackup()">☁ &nbsp;Cloud Backup (sve)</div>
-    <div class="si gh" onclick="doGitUpdate()">🐙 &nbsp;GitHub Update</div>
+    <div class="si" onclick="doBackup()">☁ &nbsp;Cloud Backup</div>
+    <div class="si gh" onclick="doGit()">🐙 &nbsp;GitHub Update</div>
     <div class="si rd" onclick="doClear()">⚠ &nbsp;Obriši memoriju</div>
     <div class="sb-sec">Multimedija</div>
-    <div class="si act" id="m-text" onclick="setMod('text')">📝 &nbsp;Tekst</div>
+    <div class="si act" id="m-text"  onclick="setMod('text')">📝 &nbsp;Tekst</div>
     <div class="si vm"  id="m-video" onclick="setMod('video')">🎬 &nbsp;Video obrada</div>
     <div class="si am"  id="m-audio" onclick="setMod('audio')">🎵 &nbsp;Audio / Glazba</div>
     <div class="si pm"  id="m-photo" onclick="setMod('photo')">📷 &nbsp;Foto / Slika</div>
   </div>
-  <div class="sb-ft">ATLAS AI OS · GitHub Update Enabled</div>
+  <div class="sb-ft">ATLAS AI OS · Groq + Gemini · Termux Edition</div>
 </aside>
 <header class="hdr">
   <button onclick="openSb()" style="background:none;border:none;color:var(--acc);font-size:23px;cursor:pointer;line-height:1">☰</button>
-  <div>
-    <div class="hdr-logo">ATLAS // IMAGO</div>
-    <div class="hdr-sub" id="mlabel">Tekst mod</div>
-  </div>
-  <div class="met">CPU <span id="cpu">—</span>% &nbsp;RAM <span id="mem">—</span>%</div>
+  <div><div class="hdr-logo">ATLAS // IMAGO</div><div class="hdr-sub" id="mlabel">Tekst mod</div></div>
+  <div class="met">BAT <span id="cpu">—</span> &nbsp;RAM <span id="mem">—</span>%</div>
   <div class="hdr-r">
     <div class="modp" id="modp">FAST</div>
     <div class="mpill" id="mpill">—</div>
@@ -289,104 +492,140 @@ body{background:var(--bg);color:var(--tx);font-family:'Syne',sans-serif;display:
 </header>
 <div class="mbar" id="mbar"></div>
 <div class="chat" id="chat">
-  <div class="msg"><div class="mm"><span class="mw atlas">Atlas</span></div><div>Sustav aktivan. Memorija učitana. GitHub povezan.</div><div class="mt">BOOT · v15.0</div></div>
+  <div class="msg"><div class="mm"><span class="mw atlas">Atlas</span></div><div>Sustav aktivan. Memorija ucitana. Groq + Gemini online. Spreman.</div><div class="mt">BOOT · v16.0</div></div>
 </div>
 <div id="find">📎 <span id="fname"></span><span onclick="clrF()" style="cursor:pointer;color:var(--rd);margin-left:5px">✕</span></div>
 <div class="izone">
   <div class="ibox" id="ibox">
-    <input type="file" id="fi" style="display:none" onchange="onFile(this)" accept="image/*,text/*,.py,.js,.json,.csv,.md,.pdf">
+    <input type="file" id="fi" style="display:none" onchange="onFile(this)" accept="image/*,text/*,.py,.js,.json,.csv,.md,.pdf,.txt,.xml">
     <button class="ibtn" onclick="document.getElementById('fi').click()">📎</button>
-    <textarea id="inp" placeholder="Pitaj Atlas..." rows="1" oninput="ar(this)" onkeydown="hk(event)"></textarea>
+    <textarea id="inp" placeholder="Pitaj Atlas... ili zalijepi URL" rows="1" oninput="ar(this)" onkeydown="hk(event)"></textarea>
     <button class="ibtn sbtn" id="sbtn" onclick="send()">➤</button>
   </div>
 </div>
 <script>
-if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/sw.js'); }
-let ws, pF=null, typEl=null, cMod='text';
-const MODS = { text: {label:'Tekst mod', ph:'Pitaj Atlas...', cls:''}, video: {label:'Video obrada', ph:'Montaza, formati, alati...', cls:'video', tools:['🎬 Montaza','⚙️ Kodeci','📐 Rezolucija','🎞️ FPS','🔊 Audio sync','📤 Export']}, audio: {label:'Audio / Glazba', ph:'Glazba, zvuk, DAW, mix...', cls:'audio', tools:['🎵 Mix','🎤 Snimanje','🔉 EQ','🥁 Ritam','📻 Format','CDC Export']}, photo: {label:'Foto / Slika', ph:'Fotografija, editing, filteri...', cls:'photo', tools:['🖼️ Edit','🎨 Boja','✂️ Crop','💡 Ekspozicija','🔲 Kompozicija','📁 Export']}, };
-function setMod(m) { cMod = m; const cfg = MODS[m]; ['text','video','audio','photo'].forEach(x => { document.getElementById('m-'+x).classList.toggle('act', x===m); }); document.getElementById('mlabel').textContent = cfg.label; document.getElementById('inp').placeholder = cfg.ph; const mp = document.getElementById('modp'); mp.textContent = m.toUpperCase(); mp.className = 'modp ' + (m!=='text' ? m : ''); const ib = document.getElementById('ibox'); ib.className = 'ibox ' + cfg.cls; document.getElementById('sbtn').className = 'ibtn sbtn ' + cfg.cls; const bar = document.getElementById('mbar'); if (cfg.tools) { bar.className = 'mbar show ' + m; bar.innerHTML = cfg.tools.map(t=>`<button class="mbtn" onclick="qp('${t}')">${t}</button>`).join(''); } else { bar.className = 'mbar'; bar.innerHTML = ''; } if(ws&&ws.readyState===1) ws.send(JSON.stringify({type:'media_mode',mode:m})); closeSb(); }
-function qp(t) { const clean = t.replace(/\p{Emoji}/gu,'').trim(); document.getElementById('inp').value = clean + ': '; document.getElementById('inp').focus(); }
-function conn() { ws = new WebSocket('ws://'+location.host+'/ws'); ws.onopen = ()=>setWs(true); ws.onclose = ()=>{setWs(false);setTimeout(conn,2500)}; ws.onmessage = e=>{ const d = JSON.parse(e.data); if(d.type==='metrics'){ document.getElementById('cpu').textContent=d.data.cpu; document.getElementById('mem').textContent=d.data.mem; return; } rmTyp(); if(d.action==='reload'){location.reload();return} if(d.message) addMsg('atlas',d.message,d.model,d.tags||[],d.mode||''); if(d.error) addMsg('error',d.error,null,[]); }; }
-function setWs(on){document.getElementById('wdot').className='wdot '+(on?'on':'off')}
-function setPill(model){ if(!model)return; const el=document.getElementById('mpill'); el.textContent=model.split(' ')[0]; const m=model.toLowerCase(); el.className='mpill '+(m.includes('gemini')?'gemini':m.includes('error')?'error':'groq'); }
-function addMsg(type,text,model,tags,mode){ const chat=document.getElementById('chat'); const now=new Date().toLocaleTimeString('hr',{hour:'2-digit',minute:'2-digit'}); const d=document.createElement('div'); d.className='msg '+(type==='atlas'?'':type); const who=type==='atlas'?'Atlas':type==='error'?'Greška':'Ti'; const wc=type==='atlas'?'atlas':type==='error'?'err':'user'; let meta=`<div class="mm"><span class="mw ${wc}">${who}</span>`; if(model){const mc=model.toLowerCase().includes('gemini')?'gemini':'groq';meta+=`<span class="tg ${mc}">${model.split(' ')[0]}</span>`;setPill(model);} const showTags=['web','url','pdf','vision','cloud','code','analysis','video','audio','photo']; showTags.forEach(t=>{if(tags.includes(t))meta+=`<span class="tg ${t}">${t.toUpperCase()}</span>`;}); meta+='</div>'; if(mode&&!['fast','text','url'].includes(mode))document.getElementById('modp').textContent=mode.toUpperCase(); d.innerHTML=meta+`<div>${esc(text)}</div><div class="mt">${now}</div>`; chat.appendChild(d);chat.scrollTop=chat.scrollHeight; }
-function showTyp(){ const chat=document.getElementById('chat'); typEl=document.createElement('div');typEl.className='msg'; typEl.innerHTML=`<div class="mm"><span class="mw atlas">Atlas</span></div><div class="dots"><span></span><span></span><span></span></div>`; chat.appendChild(typEl);chat.scrollTop=chat.scrollHeight; }
-function rmTyp(){if(typEl){typEl.remove();typEl=null}}
-function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>'); }
-function ar(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,100)+'px'}
+let ws,pF=null,typEl=null,cMod='text';
+const MODS={text:{label:'Tekst mod',ph:'Pitaj Atlas... ili zalijepi URL',cls:''},video:{label:'Video obrada',ph:'Montaza, kodeci, FPS, export...',cls:'video',tools:['🎬 Montaza','⚙️ Kodeci','📐 Rezolucija','🎞️ FPS','🔊 Audio sync','📤 Export']},audio:{label:'Audio / Glazba',ph:'Mix, EQ, snimanje, format...',cls:'audio',tools:['🎵 Mix','🎤 Snimanje','🔉 EQ','🥁 Ritam','📻 Format','💿 Export']},photo:{label:'Foto / Slika',ph:'Editing, boja, crop, kompozicija...',cls:'photo',tools:['🖼️ Edit','🎨 Boja','✂️ Crop','💡 Ekspozicija','🔲 Kompozicija','📁 Export']}};
+function setMod(m){cMod=m;const cfg=MODS[m];['text','video','audio','photo'].forEach(x=>document.getElementById('m-'+x).classList.toggle('act',x===m));document.getElementById('mlabel').textContent=cfg.label;document.getElementById('inp').placeholder=cfg.ph;const mp=document.getElementById('modp');mp.textContent=m.toUpperCase();mp.className='modp '+(m!=='text'?m:'');document.getElementById('ibox').className='ibox '+cfg.cls;document.getElementById('sbtn').className='ibtn sbtn '+cfg.cls;const bar=document.getElementById('mbar');if(cfg.tools){bar.className='mbar show '+m;bar.innerHTML=cfg.tools.map(t=>`<button class="mbtn" onclick="qp('${t}')">${t}</button>`).join('');}else{bar.className='mbar';bar.innerHTML='';}if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'media_mode',mode:m}));closeSb();}
+function qp(t){document.getElementById('inp').value=t.replace(/\p{Emoji}/gu,'').trim()+': ';document.getElementById('inp').focus();}
+function conn(){ws=new WebSocket('ws://'+location.host+'/ws');ws.onopen=()=>setWs(true);ws.onclose=()=>{setWs(false);setTimeout(conn,2500);};ws.onmessage=e=>{const d=JSON.parse(e.data);if(d.type==='metrics'){document.getElementById('cpu').textContent=d.data.cpu;document.getElementById('mem').textContent=d.data.mem;return;}rmTyp();if(d.action==='reload'){location.reload();return;}if(d.message)addMsg('atlas',d.message,d.model,d.tags||[],d.mode||'');if(d.error)addMsg('error',d.error,null,[]);};}
+function setWs(on){document.getElementById('wdot').className='wdot '+(on?'on':'off');}
+function setPill(model){if(!model)return;const el=document.getElementById('mpill');el.textContent=model.split(' ')[0];const m=model.toLowerCase();el.className='mpill '+(m.includes('gemini')?'gemini':m.includes('error')?'error':'groq');}
+function addMsg(type,text,model,tags,mode){const chat=document.getElementById('chat');const now=new Date().toLocaleTimeString('hr',{hour:'2-digit',minute:'2-digit'});const d=document.createElement('div');d.className='msg '+(type==='atlas'?'':type);const who=type==='atlas'?'Atlas':type==='error'?'Greška':'Ti';const wc=type==='atlas'?'atlas':type==='error'?'err':'user';let meta=`<div class="mm"><span class="mw ${wc}">${who}</span>`;if(model){const mc=model.toLowerCase().includes('gemini')?'gemini':'groq';meta+=`<span class="tg ${mc}">${model.split(' ')[0]}</span>`;setPill(model);}['web','url','pdf','vision','cloud','code','analysis','video','audio','photo'].forEach(t=>{if(tags.includes(t))meta+=`<span class="tg ${t}">${t.toUpperCase()}</span>`;});meta+='</div>';if(mode&&!['fast','text','url'].includes(mode))document.getElementById('modp').textContent=mode.toUpperCase();d.innerHTML=meta+`<div>${esc(text)}</div><div class="mt">${now}</div>`;chat.appendChild(d);chat.scrollTop=chat.scrollHeight;}
+function showTyp(){const chat=document.getElementById('chat');typEl=document.createElement('div');typEl.className='msg';typEl.innerHTML=`<div class="mm"><span class="mw atlas">Atlas</span></div><div class="dots"><span></span><span></span><span></span></div>`;chat.appendChild(typEl);chat.scrollTop=chat.scrollHeight;}
+function rmTyp(){if(typEl){typEl.remove();typEl=null;}}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');}
+function ar(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,100)+'px';}
 function hk(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}}
-function send(){ const inp=document.getElementById('inp'); const txt=inp.value.trim(); if(!txt&&!pF)return; const chat=document.getElementById('chat'); const d=document.createElement('div');d.className='msg user'; const badge=pF?`<div class="fbg">📎 ${pF.name}</div>`:''; d.innerHTML=`<div class="mm"><span class="mw user">Ti</span></div>${badge}<div>${esc(txt)}</div>`; chat.appendChild(d);chat.scrollTop=chat.scrollHeight; showTyp(); ws.send(JSON.stringify({text:txt,file:pF,mediaMode:cMod})); inp.value=''; inp.style.height='auto'; clrF(); }
-function onFile(input){ const file=input.files[0];if(!file)return; const reader=new FileReader(); reader.onload=e=>{ pF={name:file.name,type:file.type,data:e.target.result,isImage:file.type.startsWith('image/')}; document.getElementById('find').style.display='block'; document.getElementById('fname').textContent=file.name; }; if(file.type.startsWith('image/'))reader.readAsDataURL(file); else reader.readAsText(file); }
-function clrF(){pF=null;document.getElementById('find').style.display='none';document.getElementById('fi').value=''}
-function openSb(){document.getElementById('sb').classList.add('open');document.getElementById('ov').classList.add('on')}
-function closeSb(){document.getElementById('sb').classList.remove('open');document.getElementById('ov').classList.remove('on')}
-function newSess(){closeSb();location.reload()}
-function doBackup(){closeSb();showTyp();ws.send('__BACKUP__')}
-function doGitUpdate(){closeSb();showTyp();ws.send('__GIT_UPDATE__')}
-function doClear(){if(confirm('Obrisati memoriju?')){closeSb();ws.send('__CLEAR__')}}
-setInterval(()=>{if(ws&&ws.readyState===1)ws.send('__METRICS__')},3000);
-const cvs=document.getElementById('cvs'),ctx=cvs.getContext('2d'); let pts=[],W,H; function resize(){W=cvs.width=window.innerWidth;H=cvs.height=window.innerHeight} function spawn(x,y,n=12){for(let i=0;i<n;i++)pts.push({x,y,vx:(Math.random()-.5)*4,vy:(Math.random()-.5)*4,l:1})} function draw(){ ctx.clearRect(0,0,W,H); pts=pts.filter(p=>p.l>0); pts.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.l-=.018;ctx.beginPath();ctx.arc(p.x,p.y,1.8,0,Math.PI*2);ctx.fillStyle=`rgba(14,165,233,${p.l})`;ctx.fill()}); requestAnimationFrame(draw); } cvs.addEventListener('mousedown',e=>spawn(e.clientX,e.clientY)); cvs.addEventListener('touchstart',e=>{e.preventDefault();spawn(e.touches[0].clientX,e.touches[0].clientY)},{passive:false}); window.onresize=resize;resize();draw(); conn();
+function send(){const inp=document.getElementById('inp');const txt=inp.value.trim();if(!txt&&!pF)return;const chat=document.getElementById('chat');const d=document.createElement('div');d.className='msg user';const badge=pF?`<div class="fbg">📎 ${pF.name}</div>`:'';d.innerHTML=`<div class="mm"><span class="mw user">Ti</span></div>${badge}<div>${esc(txt)}</div>`;chat.appendChild(d);chat.scrollTop=chat.scrollHeight;showTyp();ws.send(JSON.stringify({text:txt,file:pF,mediaMode:cMod}));inp.value='';inp.style.height='auto';clrF();}
+function onFile(input){const file=input.files[0];if(!file)return;const reader=new FileReader();reader.onload=e=>{pF={name:file.name,type:file.type,data:e.target.result,isImage:file.type.startsWith('image/')};document.getElementById('find').style.display='block';document.getElementById('fname').textContent=file.name;};if(file.type.startsWith('image/'))reader.readAsDataURL(file);else reader.readAsText(file);}
+function clrF(){pF=null;document.getElementById('find').style.display='none';document.getElementById('fi').value='';}
+function openSb(){document.getElementById('sb').classList.add('open');document.getElementById('ov').classList.add('on');}
+function closeSb(){document.getElementById('sb').classList.remove('open');document.getElementById('ov').classList.remove('on');}
+function newSess(){closeSb();location.reload();}
+function doBackup(){closeSb();showTyp();ws.send('__BACKUP__');}
+function doGit(){closeSb();showTyp();ws.send('__GIT_UPDATE__');}
+function doClear(){if(confirm('Obrisati memoriju?')){closeSb();ws.send('__CLEAR__');}}
+setInterval(()=>{if(ws&&ws.readyState===1)ws.send('__METRICS__');},4000);
+const cvs=document.getElementById('cvs'),ctx=cvs.getContext('2d');let pts=[],W,H;
+function resize(){W=cvs.width=window.innerWidth;H=cvs.height=window.innerHeight;}
+function spawn(x,y,n=12){for(let i=0;i<n;i++)pts.push({x,y,vx:(Math.random()-.5)*4,vy:(Math.random()-.5)*4,l:1});}
+function draw(){ctx.clearRect(0,0,W,H);pts=pts.filter(p=>p.l>0);pts.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.l-=.018;ctx.beginPath();ctx.arc(p.x,p.y,1.8,0,Math.PI*2);ctx.fillStyle=`rgba(14,165,233,${p.l})`;ctx.fill();});requestAnimationFrame(draw);}
+cvs.addEventListener('mousedown',e=>spawn(e.clientX,e.clientY));
+cvs.addEventListener('touchstart',e=>{e.preventDefault();spawn(e.touches[0].clientX,e.touches[0].clientY);},{passive:false});
+window.onresize=resize;resize();draw();conn();
 </script>
 </body>
 </html>"""
 
-# ══════════════════════════════════════
-# FINAL ENDPOINTS & WEBSOCKET
-# ══════════════════════════════════════
-@app.get("/")
-async def home():
-    return HTMLResponse(HTML)
-
 @app.get("/manifest.json")
 async def manifest():
-    return {"name": "ATLAS OS", "short_name": "ATLAS", "start_url": "/", "display": "standalone", "background_color": "#000", "theme_color": "#0ea5e9", "icons": [{"src": "https://cdn-icons-png.flaticon.com/512/714/714390.png", "sizes": "512x512", "type": "image/png"}]}
+    return JSONResponse({"name":"ATLAS OS","short_name":"ATLAS","start_url":"/","display":"standalone","background_color":"#000","theme_color":"#0ea5e9","icons":[{"src":"https://cdn-icons-png.flaticon.com/512/714/714390.png","sizes":"512x512","type":"image/png"}]})
 
 @app.get("/sw.js")
 async def sw():
-    return HTMLResponse(content="self.addEventListener('install', e=>self.skipWaiting()); self.addEventListener('activate', e=>e.waitUntil(clients.claim())); self.addEventListener('fetch', e=>{});", media_type="application/javascript")
+    return HTMLResponse("self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(clients.claim()));self.addEventListener('fetch',e=>{});", media_type="application/javascript")
+
+@app.get("/")
+async def home():
+    return HTMLResponse(HTML)
 
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
     await init_db()
+    loop = asyncio.get_event_loop()
     session_media = "text"
     while True:
         try:
             raw = await websocket.receive_text()
             if raw == "__METRICS__":
-                await websocket.send_json({"type": "metrics", "data": get_metrics()}); continue
+                m = await loop.run_in_executor(None, get_metrics)
+                await websocket.send_json({"type":"metrics","data":m}); continue
             if raw == "__CLEAR__":
-                await clear_db(); await websocket.send_json({"action": "reload"}); continue
-            
-            data = json.loads(raw)
-            user_msg = data.get("text", "").strip()
-            file_data = data.get("file")
+                await clear_db(); await websocket.send_json({"action":"reload"}); continue
+            if raw == "__BACKUP__":
+                msg = await loop.run_in_executor(None, run_backup, "")
+                await websocket.send_json({"message":msg,"model":"SYSTEM","tags":["cloud"],"mode":"fast"}); continue
+            if raw == "__GIT_UPDATE__":
+                msg = await loop.run_in_executor(None, run_git_update)
+                await websocket.send_json({"message":msg,"model":"SYSTEM","tags":[],"mode":"fast"}); continue
+            try: data = json.loads(raw)
+            except: data = {"text": raw}
+            if data.get("type") == "media_mode":
+                session_media = data.get("mode","text"); continue
+            user_msg   = data.get("text","").strip()
+            file_data  = data.get("file")
             media_mode = data.get("mediaMode", session_media)
-
-            if file_data and (file_data.get("isImage") or "image" in file_data.get("type", "")):
-                out, model = await call_vision(file_data["data"], user_msg)
-                await websocket.send_json({"message": out, "model": model, "tags": ["vision"], "mode": "photo"})
-                continue
-
-            mode = detect_mode(user_msg)
-            tags = []
-            extra_ctx = ""
+            if not user_msg and not file_data: continue
+            if user_msg: asyncio.create_task(update_profile(user_msg))
             lang = detect_language(user_msg) if user_msg else "hr"
-
-            if mode == "wiki":
-                wiki = await _wiki_search(user_msg.lower().replace("tko je","").strip(), lang)
-                if wiki: extra_ctx = f"\n\n{wiki}"; tags.append("web")
-
-            profile = await get_profile()
-            history = await get_history()
-            messages = [{"role": "system", "content": build_system(profile, media_mode, lang)}] + history + [{"role": "user", "content": user_msg + extra_ctx}]
-            
-            out, model = await call_ai(messages)
-            await save_msg("user", user_msg); await save_msg("assistant", out)
-            await websocket.send_json({"message": out, "model": model, "tags": tags, "mode": mode})
-            
+            backup_kw = ["prenesi na oblak","upload na oblak","spremi na oblak","prenesi fajl","backup fajl"]
+            if any(k in user_msg.lower() for k in backup_kw):
+                fname = _detect_backup_file(user_msg)
+                msg = await loop.run_in_executor(None, run_backup, fname)
+                await save_msg("user", user_msg); await save_msg("assistant", msg)
+                await websocket.send_json({"message":msg,"model":"SYSTEM","tags":["cloud"],"mode":"fast"}); continue
+            if file_data and file_data.get("isImage"):
+                out, model = await call_vision(file_data["data"], user_msg)
+                await save_msg("user", f"[SLIKA] {user_msg[:150]}"); await save_msg("assistant", out)
+                await websocket.send_json({"message":out,"model":model,"tags":["vision"],"mode":"analysis"}); continue
+            mode = detect_mode(user_msg)
+            tags = []; extra_ctx = ""
+            urls = extract_urls(user_msg) if user_msg else []
+            if urls:
+                parts = []
+                for url in urls[:3]:
+                    print(f"[URL] Citam: {url}")
+                    content, ctype = await fetch_url_content(url)
+                    parts.append(f"[SADRZAJ: {url}]\n{content}")
+                    tags.append("pdf" if ctype == "pdf" else "url")
+                extra_ctx = "\n\n" + "\n\n---\n\n".join(parts)
+                mode = "url"
+            elif mode == "search":
+                is_news = any(k in user_msg.lower() for k in ["vijesti","news","danas","today","trenutno"])
+                web = await loop.run_in_executor(None, _web_search, user_msg, is_news)
+                if web: extra_ctx = f"\n\n[WEB REZULTATI]\n{web}"; tags.append("web")
+            if file_data and not file_data.get("isImage"):
+                fname = file_data.get("name","nepoznato"); fcontent = file_data.get("data","")
+                parsed = _parse_file(fname, fcontent)
+                extra_ctx += f"\n\n{parsed}"
+                if fname.lower().endswith(".pdf"): tags.append("pdf")
+            profile    = await get_profile()
+            history    = await get_history(10)
+            sys_prompt = build_system(profile, mode, lang, media_mode)
+            user_content = user_msg
+            if extra_ctx: user_content = f"{user_msg}\n{extra_ctx[:3500]}"
+            messages = [{"role":"system","content":sys_prompt}] + history + [{"role":"user","content":user_content}]
+            out, model = await call_ai(messages, mode)
+            await save_msg("user", user_msg[:400]); await save_msg("assistant", out[:600])
+            if media_mode != "text": tags.append(media_mode)
+            await websocket.send_json({"message":out,"model":model,"tags":tags,"mode":mode})
         except WebSocketDisconnect: break
-        except Exception as e: await websocket.send_json({"error": str(e)[:100]}); break
+        except Exception as e:
+            print(f"[ATLAS ERROR] {e}")
+            try: await websocket.send_json({"error":f"Greska: {str(e)[:150]}","tags":[],"mode":"fast"})
+            except: break
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
