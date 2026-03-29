@@ -11,6 +11,7 @@ cffi==2.0.0
 charset-normalizer==3.4.5
 click==8.3.1
 cryptography @ file:///home/builder/.termux-build/python-cryptography/src
+decorator==5.2.1
 distro==1.9.0
 duckduckgo-search==3.9.3
 fastapi==0.135.2
@@ -33,14 +34,18 @@ httplib2==0.31.2
 httpx==0.28.1
 hyperframe==6.1.0
 idna==3.11
+ImageIO==2.37.3
+imageio-ffmpeg==0.6.0
 itsdangerous==2.2.0
 Jinja2==3.1.6
 lxml==6.0.2
 MarkupSafe==3.0.3
+moviepy==2.2.1
 mpmath==1.3.0
 numpy @ file:///home/builder/.termux-build/python-numpy/src/dist/numpy-2.4.3-cp313-cp313-android_aarch64.whl#sha256=8ef35b7e7291aa8501ff0be8f354f3b089c4e0c08e9a905301b3551814601263
 packaging==26.0
-pillow==12.1.1
+pillow==11.3.0
+proglog==0.1.12
 proto-plus==1.27.2
 protobuf==5.29.6
 pyasn1==0.6.3
@@ -48,6 +53,7 @@ pyasn1_modules==0.4.2
 pycparser==3.0
 pydantic==2.12.5
 pydantic_core==2.41.5
+pydub==0.25.1
 pyparsing==3.3.2
 pypdf==6.7.5
 PyPDF2==3.0.1
