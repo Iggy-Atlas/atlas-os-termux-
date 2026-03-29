@@ -1,16 +1,6 @@
-# API ključevi i tajne
-.env
+*.db
+*.sqlite
 __pycache__/
-*.py[cod]
-*$py.class
-
-# Baza podataka (lokalna memorija)
-database.db
-
-# Virtualna okruženja
+*.pyc
 venv/
-env/
-.venv/
-
-# Ostalo
-.DS_Store
+.env
