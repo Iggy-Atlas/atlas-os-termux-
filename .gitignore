@@ -1,6 +1,10 @@
+.env
 *.db
-*.sqlite
 __pycache__/
 *.pyc
-venv/
+test*.txt
+fix_*.py
 .env
+auto_memory.json
+database.db
+__pycache__/

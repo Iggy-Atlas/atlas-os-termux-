@@ -1,23 +1,17 @@
-from security_agent import analyze_threat, security_response
-import os, uvicorn, httpx, json, asyncio, subprocess, re, base64, io, hashlib, time
+import os, uvicorn, httpx, json, asyncio, subprocess, re, base64, io
 from datetime import datetime
-from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from dotenv import load_dotenv
 import aiosqlite
-
-from safe_layer import validate_code, validate_url, safe_error
-from web_fix import inject_web_results, build_search_system_prompt, has_web_data
+from modules.router import handle_modules
 
 load_dotenv()
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 app = FastAPI()
-DB_PATH     = "database.db"
-PROJECT_DIR = Path(os.path.expanduser("~")) / "atlas_os_v1"
-PROJECT_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = "database.db"
 
 GROQ_MODELS = [
     "llama-3.3-70b-versatile",
@@ -47,134 +41,45 @@ URL_BLACKLIST = [
 ]
 
 # ══════════════════════════════════════
-# SECURITY / PERMISSIONS
+# AUTO MEMORY (inline — bez vanjskog importa)
 # ══════════════════════════════════════
-ALLOWED_CMDS       = ["ls", "pwd", "echo"]
-MAX_MEMORY_BYTES   = 2 * 1024 * 1024
-MAX_MEMORY_ENTRIES = 100
-MAX_AUTO_STEPS     = 4
-AUTO_TIMEOUT       = 30
-REQUIRES_APPROVAL  = {"shell", "python", "file_write", "cloud"}
-MAX_FILE_SIZE_B64  = 10 * 1024 * 1024  # 10MB base64
-
-_approved_tools: set = set()
-
-def check_permission(tool: str) -> bool:
-    return tool not in REQUIRES_APPROVAL or tool in _approved_tools
-
-def approve_tool(tool: str):
-    _approved_tools.add(tool)
-
-def blocked(tool: str) -> str:
-    return f"[BLOCKED] Permission required for: {tool}. Send 'approve:{tool}' to enable."
-
-def safe_path(path: str) -> Path | None:
-    try:
-        full = (PROJECT_DIR / path.lstrip("/")).resolve()
-        if not str(full).startswith(str(PROJECT_DIR.resolve())):
-            return None
-        return full
-    except:
-        return None
-
-# ══════════════════════════════════════
-# MODEL + SEARCH CACHE
-# ══════════════════════════════════════
-_response_cache: dict = {}
-_search_cache: dict   = {}
-_search_ts: dict      = {}
-
-def _cache_key(messages: list, temp: float) -> str:
-    content = json.dumps(messages, sort_keys=True) + str(temp)
-    return hashlib.md5(content.encode()).hexdigest()
-
-def _cache_get(key: str) -> str | None:
-    entry = _response_cache.get(key)
-    if entry and time.time() - entry["ts"] < 300:
-        return entry["val"]
-    return None
-
-def _cache_set(key: str, val: str):
-    if len(_response_cache) > 200:
-        oldest = min(_response_cache, key=lambda k: _response_cache[k]["ts"])
-        del _response_cache[oldest]
-    _response_cache[key] = {"val": val, "ts": time.time()}
-
-def _search_cache_get(query: str) -> str | None:
-    key = hashlib.md5(query.encode()).hexdigest()
-    if key in _search_cache and time.time() - _search_ts.get(key, 0) < 120:
-        return _search_cache[key]
-    return None
-
-def _search_cache_set(query: str, result: str):
-    key = hashlib.md5(query.encode()).hexdigest()
-    _search_cache[key] = result
-    _search_ts[key] = time.time()
-
-# ══════════════════════════════════════
-# AUTO MEMORY (dedup + compress)
-# ══════════════════════════════════════
-AUTO_MEMORY_PATH = PROJECT_DIR / "auto_memory.json"
-
-def _deduplicate_memory(data: list) -> list:
-    seen = set()
-    result = []
-    for entry in reversed(data):
-        key = hashlib.md5((entry.get("user","") + entry.get("atlas","")).encode()).hexdigest()
-        if key not in seen:
-            seen.add(key)
-            result.append(entry)
-    return list(reversed(result))
-
-def _compress_old_entries(data: list, keep_recent: int = 20) -> list:
-    if len(data) <= keep_recent:
-        return data
-    recent = data[-keep_recent:]
-    older  = data[:-keep_recent]
-    compressed = []
-    for i in range(0, len(older), 3):
-        chunk = older[i:i+3]
-        summary = " | ".join(e.get("user","")[:60] for e in chunk)
-        compressed.append({
-            "timestamp": chunk[-1].get("timestamp",""),
-            "user": f"[SAZETAK] {summary}",
-            "atlas": chunk[-1].get("atlas","")[:200]
-        })
-    return compressed + recent
+AUTO_MEMORY_PATH = os.path.join(os.path.expanduser("~"), "atlas_os_v1", "auto_memory.json")
 
 def auto_save(user_msg: str, ai_response: str) -> None:
+    """Sprema svaki par user/AI u auto_memory.json. Ne smije prekidati flow."""
     try:
         data = []
-        if AUTO_MEMORY_PATH.exists():
-            if AUTO_MEMORY_PATH.stat().st_size < MAX_MEMORY_BYTES:
-                with open(AUTO_MEMORY_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+        if os.path.exists(AUTO_MEMORY_PATH):
+            with open(AUTO_MEMORY_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
         data.append({
             "timestamp": str(datetime.now()),
-            "user":  user_msg[:400],
+            "user": user_msg[:400],
             "atlas": ai_response[:600]
         })
-        data = _deduplicate_memory(data)
-        data = _compress_old_entries(data)
-        data = data[-MAX_MEMORY_ENTRIES:]
+        # Zadrzaj samo zadnjih 200 zapisa
+        data = data[-200:]
+        os.makedirs(os.path.dirname(AUTO_MEMORY_PATH), exist_ok=True)
         with open(AUTO_MEMORY_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"[AUTO_MEMORY] {e}")
+        print(f"[AUTO_MEMORY] {e}")  # ne prekida flow
 
 def recall(query: str = "") -> str:
+    """Vraca zadnjih N zapisa iz auto_memory, opciono filtrirano po query."""
     try:
-        if not AUTO_MEMORY_PATH.exists():
-            return "Memorija je prazna."
+        if not os.path.exists(AUTO_MEMORY_PATH):
+            return "Memorija je prazna — nema prethodnih razgovora."
         with open(AUTO_MEMORY_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not data:
             return "Memorija je prazna."
+        # Filtriraj ako je query zadan
         if query:
-            filtered = [d for d in data
-                        if query.lower() in d.get("user","").lower()
+            filtered = [d for d in data if query.lower() in d.get("user","").lower()
                         or query.lower() in d.get("atlas","").lower()]
             data = filtered if filtered else data
+        # Zadnjih 5 zapisa
         recent = data[-5:]
         lines = []
         for d in reversed(recent):
@@ -209,33 +114,25 @@ def get_metrics() -> dict:
     return {"cpu": bat, "mem": mem}
 
 # ══════════════════════════════════════
-# DATABASE
+# DATABASE + TASK MEMORY
 # ══════════════════════════════════════
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""CREATE TABLE IF NOT EXISTS memory
-            (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, content TEXT, timestamp TEXT)""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS profile
-            (id INTEGER PRIMARY KEY, data TEXT)""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS tasks
-            (id INTEGER PRIMARY KEY AUTOINCREMENT, goal TEXT, result TEXT, timestamp TEXT)""")
+        await db.execute("CREATE TABLE IF NOT EXISTS memory (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, content TEXT, timestamp TEXT)")
+        await db.execute("CREATE TABLE IF NOT EXISTS profile (id INTEGER PRIMARY KEY, data TEXT)")
+        await db.execute("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, goal TEXT, result TEXT, timestamp TEXT)")
         await db.commit()
 
 async def save_msg(role: str, content: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO memory (role, content, timestamp) VALUES (?,?,?)",
-            (role, str(content)[:600], str(datetime.now())))
-        await db.execute(
-            "DELETE FROM memory WHERE id NOT IN "
-            "(SELECT id FROM memory ORDER BY id DESC LIMIT 40)")
+        await db.execute("INSERT INTO memory (role, content, timestamp) VALUES (?,?,?)",
+                         (role, str(content)[:600], str(datetime.now())))
+        await db.execute("DELETE FROM memory WHERE id NOT IN (SELECT id FROM memory ORDER BY id DESC LIMIT 40)")
         await db.commit()
 
 async def get_history(limit: int = 10) -> list:
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT role, content FROM memory ORDER BY id DESC LIMIT ?", (limit,)
-        ) as c:
+        async with db.execute("SELECT role, content FROM memory ORDER BY id DESC LIMIT ?", (limit,)) as c:
             rows = await c.fetchall()
     return [{"role": r, "content": cnt} for r, cnt in reversed(rows)]
 
@@ -246,20 +143,15 @@ async def clear_db():
 
 async def save_task(goal: str, result: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO tasks (goal, result, timestamp) VALUES (?,?,?)",
-            (goal[:300], result[:800], str(datetime.now())))
-        await db.execute(
-            "DELETE FROM tasks WHERE id NOT IN "
-            "(SELECT id FROM tasks ORDER BY id DESC LIMIT 10)")
+        await db.execute("INSERT INTO tasks (goal, result, timestamp) VALUES (?,?,?)",
+                         (goal[:300], result[:800], str(datetime.now())))
+        await db.execute("DELETE FROM tasks WHERE id NOT IN (SELECT id FROM tasks ORDER BY id DESC LIMIT 10)")
         await db.commit()
 
 async def get_last_task() -> dict:
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
-                "SELECT goal, result, timestamp FROM tasks ORDER BY id DESC LIMIT 1"
-            ) as c:
+            async with db.execute("SELECT goal, result, timestamp FROM tasks ORDER BY id DESC LIMIT 1") as c:
                 row = await c.fetchone()
         if row:
             return {"goal": row[0], "result": row[1], "timestamp": row[2]}
@@ -292,23 +184,14 @@ async def update_profile(user_msg: str):
         return
     try:
         model = _groq_model or GROQ_MODELS[0]
-        prompt = (
-            f'Extract user info as JSON only. '
-            f'Schema: {{"name":"","preferences":[],"projects":[]}} '
-            f'Message: {user_msg[:300]}'
-        )
+        prompt = f'Extract user info as JSON only. Schema: {{"name":"","preferences":[],"projects":[]}} Message: {user_msg[:300]}'
         async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}",
-                         "Content-Type": "application/json"},
+            r = await client.post("https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
                 json={"model": model, "max_tokens": 150, "temperature": 0.1,
                       "messages": [{"role": "user", "content": prompt}]})
-            if r.status_code != 200:
-                return
-            raw = re.sub(r"```json?", "",
-                         r.json()["choices"][0]["message"]["content"]
-                         ).replace("```","").strip()
+            if r.status_code != 200: return
+            raw = re.sub(r"```json?", "", r.json()["choices"][0]["message"]["content"]).replace("```","").strip()
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("INSERT OR REPLACE INTO profile VALUES (1,?)",
                                  (json.dumps(json.loads(raw)),))
@@ -331,18 +214,11 @@ async def get_profile() -> dict:
 def detect_language(text: str) -> str:
     t = text.lower()
     scores = {
-        "hr": sum(1 for w in ["što","kako","zašto","gdje","kada","imam","treba",
-                               "mogu","ovo","nije","da","ali","jer","sam","koji"]
-                  if w in t.split()),
-        "en": sum(1 for w in ["what","how","why","where","when","have","need",
-                               "can","this","that","the","and","for","is","are"]
-                  if w in t.split()),
-        "de": sum(1 for w in ["was","wie","warum","wo","ich","habe","kann",
-                               "das","und","ist"] if w in t.split()),
-        "fr": sum(1 for w in ["que","comment","pourquoi","je","avoir","peut",
-                               "est","les","des"] if w in t.split()),
-        "es": sum(1 for w in ["que","como","por","yo","tengo","puede","los",
-                               "una","para"] if w in t.split()),
+        "hr": sum(1 for w in ["što","kako","zašto","gdje","kada","imam","treba","mogu","ovo","nije","da","ali","jer","sam","koji"] if w in t.split()),
+        "en": sum(1 for w in ["what","how","why","where","when","have","need","can","this","that","the","and","for","is","are"] if w in t.split()),
+        "de": sum(1 for w in ["was","wie","warum","wo","ich","habe","kann","das","und","ist"] if w in t.split()),
+        "fr": sum(1 for w in ["que","comment","pourquoi","je","avoir","peut","est","les","des"] if w in t.split()),
+        "es": sum(1 for w in ["que","como","por","yo","tengo","puede","los","una","para"] if w in t.split()),
     }
     best = max(scores, key=scores.get)
     return best if scores[best] > 0 else "hr"
@@ -350,295 +226,104 @@ def detect_language(text: str) -> str:
 def detect_mode(msg: str) -> str:
     m = msg.lower()
     if re.search(r'https?://', m): return "url"
-    if any(k in m for k in ["bug","error","greška","kod","debug","fix",
-                              "python","script","funkcij","code"]): return "code"
-    if any(k in m for k in ["zašto","objasni","analiziraj","usporedi",
-                              "razlika","kako radi","sto je","analyze",
-                              "explain","compare"]): return "analysis"
-    if any(k in m for k in ["ideja","napravi","smisli","kreativan",
-                              "prijedlog","osmisli","create","design",
-                              "imagine"]): return "creative"
-    if any(k in m for k in ["vijesti","danas","pretrazi","tko je","ko je",
-                              "cijena","trenutno","news","search",
-                              "today"]): return "search"
+    if any(k in m for k in ["bug","error","greška","kod","debug","fix","python","script","funkcij","code"]): return "code"
+    if any(k in m for k in ["zašto","objasni","analiziraj","usporedi","razlika","kako radi","sto je","analyze","explain","compare"]): return "analysis"
+    if any(k in m for k in ["ideja","napravi","smisli","kreativan","prijedlog","osmisli","create","design","imagine"]): return "creative"
+    if any(k in m for k in ["vijesti","danas","pretrazi","tko je","ko je","cijena","trenutno","news","search","today"]): return "search"
     return "fast"
 
 # ══════════════════════════════════════
-# SECURE TOOL SYSTEM
+# TOOL SYSTEM
 # ══════════════════════════════════════
 def tool_file_write(path: str, content: str) -> str:
-    if not check_permission("file_write"):
-        return blocked("file_write")
-    full = safe_path(path)
-    if not full:
-        return safe_error("Path traversal blocked", "file_write")
     try:
-        full.parent.mkdir(parents=True, exist_ok=True)
-        full.write_text(content, encoding="utf-8")
+        full = os.path.join(os.path.expanduser("~"), "atlas_os_v1", path.lstrip("/"))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(content)
         return f"[TOOL] Fajl zapisan: {path}"
     except Exception as e:
-        return safe_error(str(e), "file_write")
+        return f"[TOOL ERROR] file_write: {e}"
 
 def tool_file_read(path: str) -> str:
-    full = safe_path(path)
-    if not full:
-        return safe_error("Path traversal blocked", "file_read")
     try:
-        return f"[TOOL] {path}:\n{full.read_text(encoding='utf-8')[:3000]}"
+        full = os.path.join(os.path.expanduser("~"), "atlas_os_v1", path.lstrip("/"))
+        with open(full, "r", encoding="utf-8") as f:
+            return f"[TOOL] {path}:\n{f.read()[:3000]}"
     except Exception as e:
-        return safe_error(str(e), "file_read")
+        return f"[TOOL ERROR] file_read: {e}"
 
 def tool_list_files(path: str = ".") -> str:
-    full = safe_path(path)
-    if not full:
-        return safe_error("Path traversal blocked", "list_files")
     try:
-        files = [f.name for f in full.iterdir()]
+        full = os.path.join(os.path.expanduser("~"), "atlas_os_v1", path.lstrip("/"))
+        files = os.listdir(full)
         return f"[TOOL] Fajlovi u {path}:\n" + "\n".join(files[:50])
     except Exception as e:
-        return safe_error(str(e), "list_files")
+        return f"[TOOL ERROR] list_files: {e}"
 
 def tool_run_python(code: str) -> str:
-    if not check_permission("python"):
-        return blocked("python")
-
-    # safe_layer validation
-    check = validate_code(code)
-    if not check["safe"]:
-        return safe_error(check["reason"], "python")
-
-    allowed_builtins = {
-        "print": print, "len": len, "range": range,
-        "str": str, "int": int, "float": float,
-        "list": list, "dict": dict, "bool": bool,
-        "sum": sum, "min": min, "max": max, "abs": abs,
-        "round": round, "sorted": sorted, "enumerate": enumerate,
-        "zip": zip, "map": map, "filter": filter,
-    }
-    try:
-        output_lines = []
-        def safe_print(*args, **kwargs):
-            output_lines.append(" ".join(str(a) for a in args))
-        allowed_builtins["print"] = safe_print
-        exec(compile(code, "<atlas>", "exec"), {"__builtins__": allowed_builtins})
-        result = "\n".join(output_lines)
-        return f"[TOOL] Python output:\n{result[:1000]}" if result else "[TOOL] Python: OK (no output)"
-    except Exception as e:
-        return safe_error(str(e)[:200], "python")
-
-def tool_run_shell(cmd: str) -> str:
-    if not check_permission("shell"):
-        return blocked("shell")
-    parts = cmd.strip().split()
-    if not parts:
-        return safe_error("Empty command", "shell")
-    if parts[0] not in ALLOWED_CMDS:
-        return safe_error(
-            f"Command not in whitelist: {parts[0]}. Allowed: {ALLOWED_CMDS}",
-            "shell"
-        )
     try:
         result = subprocess.run(
-            parts, capture_output=True, text=True, timeout=10,
-            cwd=str(PROJECT_DIR)
+            ["python3", "-c", code],
+            capture_output=True, text=True, timeout=10,
+            cwd=os.path.join(os.path.expanduser("~"), "atlas_os_v1")
+        )
+        out = result.stdout[:1000] or ""
+        err = result.stderr[:500] or ""
+        return f"[TOOL] Python output:\n{out}" + (f"\nStderr: {err}" if err else "")
+    except subprocess.TimeoutExpired:
+        return "[TOOL ERROR] run_python: Timeout (10s)"
+    except Exception as e:
+        return f"[TOOL ERROR] run_python: {e}"
+
+def tool_run_shell(cmd: str) -> str:
+    BLOCKED = ["rm -rf /", "mkfs", "dd if=", ":(){:|:&};:"]
+    if any(b in cmd for b in BLOCKED):
+        return "[TOOL ERROR] run_shell: Naredba blokirana zbog sigurnosti."
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=15,
+            cwd=os.path.join(os.path.expanduser("~"), "atlas_os_v1")
         )
         out = result.stdout[:1000] or ""
         err = result.stderr[:300] or ""
         return f"[TOOL] Shell output:\n{out}" + (f"\nStderr: {err}" if err else "")
     except subprocess.TimeoutExpired:
-        return safe_error("Timeout (10s)", "shell")
+        return "[TOOL ERROR] run_shell: Timeout (15s)"
     except Exception as e:
-        return safe_error(str(e), "shell")
-
-def tool_cloud_upload(filepath: str) -> str:
-    if not check_permission("cloud"):
-        return blocked("cloud")
-    full = safe_path(filepath)
-    if not full:
-        return safe_error("Path traversal blocked", "cloud")
-    if not full.exists():
-        return safe_error(f"File not found: {filepath}", "cloud")
-    try:
-        result = subprocess.run(
-            ["rclone", "copy", str(full), "remote:AtlasBackup/"],
-            capture_output=True, text=True, timeout=60
-        )
-        if result.returncode == 0:
-            return json.dumps({"success": True, "file": filepath, "module": "cloud"})
-        return safe_error(result.stderr[:200], "cloud")
-    except FileNotFoundError:
-        return safe_error("rclone not installed", "cloud")
-    except subprocess.TimeoutExpired:
-        return safe_error("Upload timeout", "cloud")
-    except Exception as e:
-        return safe_error(str(e), "cloud")
-
-TOOLS = {
-    "file_write": tool_file_write,
-    "file_read":  tool_file_read,
-    "shell":      tool_run_shell,
-    "python":     tool_run_python,
-    "cloud":      tool_cloud_upload,
-}
+        return f"[TOOL ERROR] run_shell: {e}"
 
 def handle_tool_request(msg: str) -> str | None:
+    """
+    TOOL PRIORITY: user → tool → AI
+    Vraca rezultat ili None ako nije tool request.
+    """
     m = msg.strip()
     if m.startswith("TOOL:file_write:"):
         parts = m.split(":", 3)
         if len(parts) >= 4:
-            return TOOLS["file_write"](parts[2], parts[3])
+            return tool_file_write(parts[2], parts[3])
     if m.startswith("TOOL:file_read:"):
-        return TOOLS["file_read"](m.split(":", 2)[-1])
+        path = m.split(":", 2)[-1]
+        return tool_file_read(path)
     if m.startswith("TOOL:list_files"):
         path = m.split(":", 2)[-1] if m.count(":") >= 2 else "."
         return tool_list_files(path)
     if m.startswith("TOOL:run_python:"):
-        return TOOLS["python"](m.split(":", 2)[-1])
+        code = m.split(":", 2)[-1]
+        return tool_run_python(code)
     if m.startswith("TOOL:run_shell:"):
-        return TOOLS["shell"](m.split(":", 2)[-1])
+        cmd = m.split(":", 2)[-1]
+        return tool_run_shell(cmd)
     lm = m.lower()
     if lm.startswith("pokazi fajlove") or lm.startswith("list files"):
         return tool_list_files(".")
-    match = re.match(r'^(?:procitaj|otvori) fajl (.+)', lm)
-    if match:
-        return TOOLS["file_read"](match.group(1).strip())
-    match = re.match(r'^pokreni: (.+)', m)
-    if match:
-        return TOOLS["shell"](match.group(1).strip())
-    return None
-
-# ══════════════════════════════════════
-# MULTIMEDIA PROCESSING
-# ══════════════════════════════════════
-def _safe_b64_decode(b64: str) -> bytes | None:
-    try:
-        raw = base64.b64decode(b64)
-        if len(raw) > MAX_FILE_SIZE_B64:
-            return None
-        return raw
-    except:
-        return None
-
-def process_image_meta(b64: str, mime: str) -> dict:
-    try:
-        from PIL import Image
-        raw = _safe_b64_decode(b64)
-        if not raw:
-            return {"error": "File too large or invalid"}
-        img = Image.open(io.BytesIO(raw))
-        return {"format": img.format or mime.split("/")[-1].upper(),
-                "size": f"{img.width}x{img.height}",
-                "mode": img.mode, "bytes": len(raw)}
-    except ImportError:
-        return {"format": mime, "bytes": len(base64.b64decode(b64))}
-    except Exception as e:
-        return {"error": str(e)[:100]}
-
-def process_image_resize(b64: str, mime: str, max_px: int = 1024) -> str:
-    try:
-        from PIL import Image
-        raw = _safe_b64_decode(b64)
-        if not raw:
-            return b64
-        img = Image.open(io.BytesIO(raw))
-        img.thumbnail((max_px, max_px), Image.LANCZOS)
-        buf = io.BytesIO()
-        fmt = "JPEG" if "jpeg" in mime or "jpg" in mime else "PNG"
-        img.save(buf, format=fmt)
-        return base64.b64encode(buf.getvalue()).decode()
-    except Exception:
-        return b64
-
-def process_image_convert(b64: str, target_fmt: str = "jpeg") -> tuple:
-    try:
-        from PIL import Image
-        raw = _safe_b64_decode(b64)
-        if not raw:
-            return b64, f"image/{target_fmt}"
-        img = Image.open(io.BytesIO(raw))
-        if target_fmt.lower() == "jpeg" and img.mode in ("RGBA","P"):
-            img = img.convert("RGB")
-        buf = io.BytesIO()
-        img.save(buf, format=target_fmt.upper())
-        new_b64 = base64.b64encode(buf.getvalue()).decode()
-        mime = f"image/{'jpeg' if target_fmt.lower() in ('jpg','jpeg') else target_fmt.lower()}"
-        return new_b64, mime
-    except Exception:
-        return b64, f"image/{target_fmt}"
-
-def process_audio_meta(b64: str, mime: str, filename: str = "") -> dict:
-    import struct
-    ext = filename.split(".")[-1].lower() if "." in filename else mime.split("/")[-1]
-    raw = _safe_b64_decode(b64)
-    if not raw:
-        return {"error": "File too large"}
-    info = {"format": ext.upper(), "mime": mime, "size_bytes": len(raw)}
-    try:
-        if ext == "mp3" and raw[:3] == b"ID3":
-            info["tag"] = "ID3"
-        if ext == "wav" and raw[:4] == b"RIFF":
-            channels    = struct.unpack_from("<H", raw, 22)[0]
-            sample_rate = struct.unpack_from("<I", raw, 24)[0]
-            bits        = struct.unpack_from("<H", raw, 34)[0]
-            data_size   = struct.unpack_from("<I", raw, 40)[0]
-            duration    = data_size / (sample_rate * channels * bits // 8) if sample_rate else 0
-            info.update({"channels": channels, "sample_rate": sample_rate,
-                         "bits": bits, "duration_s": round(duration, 2)})
-    except:
-        pass
-    return info
-
-def process_video_meta(b64: str, mime: str, filename: str = "") -> dict:
-    ext = filename.split(".")[-1].lower() if "." in filename else mime.split("/")[-1]
-    raw = _safe_b64_decode(b64)
-    if not raw:
-        return {"error": "File too large"}
-    info = {"format": ext.upper(), "mime": mime, "size_bytes": len(raw),
-            "note": "Deep analysis requires ffprobe"}
-    try:
-        if raw[:4] in (b'\x00\x00\x00\x18', b'\x00\x00\x00\x20', b'ftyp'):
-            info["container"] = "MP4/MOV"
-        elif raw[:4] == b'\x1a\x45\xdf\xa3':
-            info["container"] = "MKV/WebM"
-        elif raw[:3] == b'FLV':
-            info["container"] = "FLV"
-    except:
-        pass
-    return info
-
-def handle_media_processing(file_data: dict, user_msg: str) -> dict | None:
-    if not file_data:
-        return None
-    fname    = file_data.get("name","")
-    ftype    = file_data.get("type","")
-    raw_data = file_data.get("data","")
-    if len(raw_data) > MAX_FILE_SIZE_B64 * 1.4:
-        return {"result": "[BLOCKED] File too large for local processing (max 10MB).", "tag": "photo"}
-    b64     = raw_data.split(",")[-1] if "," in raw_data else raw_data
-    msg_low = user_msg.lower()
-
-    if file_data.get("isImage"):
-        if any(k in msg_low for k in ["metadata","info","velicina","size","format"]):
-            meta = process_image_meta(b64, ftype)
-            return {"result": f"Slika info: {json.dumps(meta, ensure_ascii=False)}", "tag": "photo"}
-        if any(k in msg_low for k in ["smanji","resize","skaliraj"]):
-            new_b64 = process_image_resize(b64, ftype)
-            return {"result": "Slika smanjena na max 1024px.", "b64": new_b64, "mime": ftype, "tag": "photo"}
-        if any(k in msg_low for k in ["jpeg","png","konverti"]):
-            fmt = "jpeg" if "jpeg" in msg_low else "png"
-            new_b64, new_mime = process_image_convert(b64, fmt)
-            return {"result": f"Slika konvertirana u {fmt.upper()}.", "b64": new_b64, "mime": new_mime, "tag": "photo"}
-
-    if file_data.get("isAudio"):
-        if any(k in msg_low for k in ["info","metadata","format","trajanje","duration"]):
-            meta = process_audio_meta(b64, ftype, fname)
-            return {"result": f"Audio info: {json.dumps(meta, ensure_ascii=False)}", "tag": "audio"}
-
-    if file_data.get("isVideo"):
-        if any(k in msg_low for k in ["info","metadata","format","rezolucija","fps","trajanje"]):
-            meta = process_video_meta(b64, ftype, fname)
-            return {"result": f"Video info: {json.dumps(meta, ensure_ascii=False)}", "tag": "video"}
-
+    if re.match(r'^(procitaj|otvori) fajl (.+)', lm):
+        match = re.match(r'^(?:procitaj|otvori) fajl (.+)', lm)
+        if match: return tool_file_read(match.group(1).strip())
+    if re.match(r'^pokreni: (.+)', m):
+        match = re.match(r'^pokreni: (.+)', m)
+        if match: return tool_run_shell(match.group(1).strip())
     return None
 
 # ══════════════════════════════════════
@@ -649,11 +334,6 @@ def extract_urls(text: str) -> list:
     return [u for u in found if not any(b in u for b in URL_BLACKLIST)]
 
 async def fetch_url_content(url: str) -> tuple:
-    # safe_layer URL validation
-    url_check = validate_url(url)
-    if not url_check["safe"]:
-        return f"[BLOCKED] {url_check['reason']}", "error"
-
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/pdf,*/*;q=0.9"
@@ -673,12 +353,12 @@ async def fetch_url_content(url: str) -> tuple:
                         r'<header[^>]*>.*?</header>', r'<!--.*?-->']:
                 html = re.sub(pat, '', html, flags=re.DOTALL|re.IGNORECASE)
             html = re.sub(r'<[^>]+>', ' ', html)
-            html = re.sub(r'&[a-zA-Z#0-9]+;', ' ', html)
+            html = re.sub(r'&[a-zA-Z]+;', ' ', html)
             html = re.sub(r'\s+', ' ', html).strip()
             return html[:4000], "web"
     except httpx.TimeoutException: return "[Timeout]", "error"
-    except httpx.ConnectError:     return "[Greska veze]", "error"
-    except Exception as e:         return f"[Greska: {str(e)[:120]}]", "error"
+    except httpx.ConnectError: return "[Greska veze]", "error"
+    except Exception as e: return f"[Greska: {str(e)[:120]}]", "error"
 
 def _parse_pdf(content: bytes) -> str:
     try:
@@ -690,15 +370,14 @@ def _parse_pdf(content: bytes) -> str:
         return f"[PDF — {len(reader.pages)} stranica]\n{text[:5000]}"
     except ImportError:
         try:
-            raw    = content.decode("latin-1", errors="ignore")
+            raw = content.decode("latin-1", errors="ignore")
             chunks = re.findall(r'BT\s*(.*?)\s*ET', raw, re.DOTALL)
-            texts  = [p for c in chunks for p in re.findall(r'\((.*?)\)', c)]
+            texts = [p for c in chunks for p in re.findall(r'\((.*?)\)', c)]
             result = " ".join(texts)
             if result: return f"[PDF parcijalno]\n{result[:4000]}"
         except: pass
         return "[PDF ucitan. Instaliraj: pip install pypdf]"
-    except Exception as e:
-        return f"[PDF greska: {str(e)[:100]}]"
+    except Exception as e: return f"[PDF greska: {str(e)[:100]}]"
 
 def _parse_file(name: str, content: str) -> str:
     ext = name.lower().split(".")[-1] if "." in name else ""
@@ -707,46 +386,24 @@ def _parse_file(name: str, content: str) -> str:
             b64 = content.split(",")[1] if "," in content else content
             return _parse_pdf(base64.b64decode(b64))
         except Exception as e: return f"[PDF greska: {e}]"
-    if ext == "csv":
-        return "[CSV]\n" + "\n".join(content.split("\n")[:50])
+    if ext == "csv": return "[CSV]\n" + "\n".join(content.split("\n")[:50])
     if ext == "json":
         try: return f"[JSON]\n{json.dumps(json.loads(content), indent=2, ensure_ascii=False)[:3000]}"
         except: pass
     return f"[Fajl: {name}]\n{content[:3000]}"
 
 # ══════════════════════════════════════
-# WEB SEARCH (safe + cached)
+# WEB SEARCH
 # ══════════════════════════════════════
-def _sanitize_query(query: str) -> str:
-    query = re.sub(r'[<>&"\']', '', query)
-    return query[:200].strip()
-
 def _web_search(query: str, news: bool = False) -> str:
-    query = _sanitize_query(query)
-    if not query:
-        return ""
-    cache_key = ("news:" if news else "") + query
-    cached = _search_cache_get(cache_key)
-    if cached:
-        return cached
     try:
         from duckduckgo_search import DDGS
         with DDGS() as ddgs:
             if news:
                 results = list(ddgs.news(query, max_results=5))
-                out = "\n".join(
-                    f"• [{r.get('date','')[:10]}] {r['title']}: "
-                    f"{re.sub(r'<[^>]+>',' ',r.get('body',''))[:200]}"
-                    for r in results
-                )
-            else:
-                results = list(ddgs.text(query, max_results=5))
-                out = "\n".join(
-                    f"• {r['title']}: {re.sub(r'<[^>]+>',' ',r['body'])[:200]}"
-                    for r in results
-                )
-        _search_cache_set(cache_key, out)
-        return out
+                return "\n".join(f"• [{r.get('date','')[:10]}] {r['title']}: {r.get('body','')[:200]}" for r in results)
+            results = list(ddgs.text(query, max_results=5))
+            return "\n".join(f"• {r['title']}: {r['body'][:200]}" for r in results)
     except Exception as e:
         print(f"[SEARCH] {e}")
         return ""
@@ -755,34 +412,21 @@ def _web_search(query: str, news: bool = False) -> str:
 # BACKUP & GIT
 # ══════════════════════════════════════
 def run_backup(filepath: str = "") -> str:
-    if filepath:
-        if not check_permission("cloud"):
-            return blocked("cloud")
-        full = safe_path(filepath)
-        if not full:
-            return safe_error("Path traversal blocked", "backup")
-        if not full.exists():
-            return f"Fajl nije pronaden: {filepath}"
-        try:
-            result = subprocess.run(
-                ["rclone", "copy", str(full), "remote:AtlasBackup/"],
-                capture_output=True, text=True, timeout=60
-            )
-            return (f"Fajl prenesen: {full.name}" if result.returncode == 0
-                    else f"rclone greska: {result.stderr[:200]}")
-        except FileNotFoundError:    return "rclone nije instaliran."
-        except subprocess.TimeoutExpired: return "Backup timeout."
-        except Exception as e:       return f"Backup greska: {str(e)[:100]}"
     try:
-        result = subprocess.run(
-            ["python", "cloud_backup.py"],
-            capture_output=True, text=True, timeout=120,
-            cwd=str(PROJECT_DIR)
-        )
-        return ("Backup zavrsen." if result.returncode == 0
-                else f"Backup greska: {result.stderr[:200]}")
+        if filepath:
+            fp = filepath.strip().strip("'\"")
+            if not os.path.isabs(fp):
+                fp = os.path.join(os.path.expanduser("~"), "atlas_os_v1", fp)
+            if os.path.exists(fp):
+                result = subprocess.run(["rclone", "copy", fp, "remote:AtlasBackup/", "-v"],
+                                        capture_output=True, text=True, timeout=120)
+                return f"Fajl prenesen: {os.path.basename(fp)}" if result.returncode == 0 else f"rclone greska: {result.stderr[:200]}"
+            return f"Fajl nije pronaden: {fp}"
+        result = subprocess.run(["python", "cloud_backup.py"], capture_output=True, text=True, timeout=120)
+        return "Backup zavrsen." if result.returncode == 0 else f"Backup greska: {result.stderr[:200]}"
+    except FileNotFoundError: return "rclone nije instaliran."
     except subprocess.TimeoutExpired: return "Backup timeout."
-    except Exception as e:            return f"Backup greska: {str(e)[:100]}"
+    except Exception as e: return f"Backup greska: {str(e)[:100]}"
 
 def _detect_backup_file(msg: str) -> str:
     for p in [r'prenesi\s+["\']?(.+?)["\']?\s+na\s+oblak',
@@ -794,18 +438,12 @@ def _detect_backup_file(msg: str) -> str:
 
 def run_git_update() -> str:
     try:
-        result = subprocess.run(
-            ["git", "pull"], capture_output=True, text=True,
-            timeout=60, cwd=str(PROJECT_DIR)
-        )
-        return (f"GitHub update uspjesan.\n{result.stdout[:300]}"
-                if result.returncode == 0
-                else f"Git greska:\n{result.stderr[:300]}")
-    except Exception as e:
-        return f"Git greska: {e}"
+        result = subprocess.run(["git", "pull"], capture_output=True, text=True, timeout=60)
+        return f"GitHub update uspjesan.\n{result.stdout[:300]}" if result.returncode == 0 else f"Git greska:\n{result.stderr[:300]}"
+    except Exception as e: return f"Git greska: {e}"
 
 # ══════════════════════════════════════
-# SYSTEM PROMPT
+# SYSTEM PROMPT — s Truth Mode
 # ══════════════════════════════════════
 LANG_RULES = {
     "hr": "Jezik: standardni hrvatski knjizevni. Gramaticki ispravno.",
@@ -818,40 +456,43 @@ MODE_INSTRUCTIONS = {
     "code":     "Samo kod + kratko objasnjenje.",
     "analysis": "Korak po korak. Jasan zakljucak.",
     "creative": "Originalno. Izbjegavaj kliseje.",
-    "search":   "Koristi ISKLJUCIVO priložene web podatke. Ako nema — reci da nema.",
+    "search":   "Konkretno. Koristi web podatke.",
     "url":      "Analiziraj ucitani sadrzaj. Kljucne tocke.",
     "fast":     "Direktno i kratko.",
     "video":    "Strucnjak za video produkciju.",
     "audio":    "Strucnjak za audio i glazbu.",
     "photo":    "Strucnjak za fotografiju.",
 }
+
+# TRUTH MODE — aktivira se kad nema stvarnih podataka
 TRUTH_MODE_RULE = (
-    "ANTI-HALLUCINATION: Ako nemas stvarne podatke, reci jasno da ne mozes "
-    "dohvatiti informacije. NE izmisljaj cinjenice, datume, ljude, citate ili statistike."
+    "ANTI-HALLUCINATION: Ako nemas stvarne podatke (URL sadrzaj, web rezultate, "
+    "fajl ili konkretne cinjenice), reci jasno da ne mozes dohvatiti informacije. "
+    "NE izmisljaj cinjenice, datume, ljude, citate ili statistike."
 )
 
 def build_system(profile: dict, mode: str, lang: str, media_mode: str,
                  task_context: str = "", has_real_data: bool = False) -> str:
-    name     = profile.get("name","")
-    prefs    = profile.get("preferences",[])
+    name = profile.get("name","")
+    prefs = profile.get("preferences",[])
     projects = profile.get("projects",[])
     user_ctx = ""
-    if name:     user_ctx += f"Korisnik: {name}. "
-    if prefs:    user_ctx += f"Interesi: {', '.join(prefs[:4])}. "
+    if name: user_ctx += f"Korisnik: {name}. "
+    if prefs: user_ctx += f"Interesi: {', '.join(prefs[:4])}. "
     if projects: user_ctx += f"Projekti: {', '.join(projects[:3])}. "
     media_ctx = f" MULTIMEDIJSKI MOD: {media_mode.upper()}." if media_mode != "text" else ""
-    task_ctx  = f"\nPRETHODNI ZADATAK: {task_context}" if task_context else ""
+    task_ctx = f"\nPRETHODNI ZADATAK: {task_context}" if task_context else ""
+    # Truth mode samo kad nema stvarnih podataka
     truth_ctx = f"\n{TRUTH_MODE_RULE}" if not has_real_data else ""
-    # For search mode, append explicit search constraint
-    search_addon = f"\n{build_search_system_prompt(lang)}" if mode == "search" else ""
     return (
-        f"Ti si ATLAS — napredni AI operativni sustav. v18.1{media_ctx}\n"
+        f"Ti si ATLAS — napredni AI operativni sustav.{media_ctx}\n"
         f"MOD: {mode.upper()} — {MODE_INSTRUCTIONS.get(mode, MODE_INSTRUCTIONS['fast'])}\n"
         f"{LANG_RULES.get(lang, LANG_RULES['hr'])}\n"
         f"KARAKTER: Direktan. Iskren. Bez laskanja. Bez 'Naravno!' i slicnih fraza.\n"
-        f"SPOSOBNOSTI: Citas URL-ove i PDF-ove. Web pretraga. Cloud backup. Multimedija. Pamtis razgovor.\n"
+        f"SPOSOBNOSTI: Citas URL-ove i PDF-ove. Web pretraga. Cloud backup. Pamtis razgovor.\n"
         + (f"PROFIL: {user_ctx}\n" if user_ctx else "")
-        + task_ctx + truth_ctx + search_addon + "\n"
+        + task_ctx
+        + truth_ctx + "\n"
         + "Kod u blokovima. Tablice u markdown formatu."
     )
 
@@ -861,86 +502,57 @@ def build_system(profile: dict, mode: str, lang: str, media_mode: str,
 async def call_groq(messages: list, temp: float) -> str | None:
     global _groq_model
     messages = trim_messages(messages, 4500)
-    ck = _cache_key(messages, temp)
-    cached = _cache_get(ck)
-    if cached:
-        return cached
-    order = ([_groq_model] + [m for m in GROQ_MODELS if m != _groq_model]
-             if _groq_model else GROQ_MODELS)
+    order = ([_groq_model] + [m for m in GROQ_MODELS if m != _groq_model] if _groq_model else GROQ_MODELS)
     async with httpx.AsyncClient(timeout=45) as client:
         for model in order:
             try:
-                r = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}",
-                             "Content-Type": "application/json"},
-                    json={"model": model, "messages": messages,
-                          "temperature": temp, "max_tokens": 1000})
+                r = await client.post("https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json={"model": model, "messages": messages, "temperature": temp, "max_tokens": 1000})
                 if r.status_code == 200:
-                    if _groq_model != model:
-                        print(f"[GROQ] Aktivan: {model}")
-                        _groq_model = model
-                    result = r.json()["choices"][0]["message"]["content"]
-                    _cache_set(ck, result)
-                    return result
+                    if _groq_model != model: print(f"[GROQ] Aktivan: {model}"); _groq_model = model
+                    return r.json()["choices"][0]["message"]["content"]
                 if r.status_code == 413:
                     messages = trim_messages(messages, 2500)
-                    r2 = await client.post(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {GROQ_API_KEY}",
-                                 "Content-Type": "application/json"},
-                        json={"model": model, "messages": messages,
-                              "temperature": temp, "max_tokens": 700})
-                    if r2.status_code == 200:
-                        _groq_model = model
-                        result = r2.json()["choices"][0]["message"]["content"]
-                        _cache_set(ck, result)
-                        return result
-                if r.status_code == 429:
-                    print(f"[GROQ] {model} rate limit"); continue
+                    r2 = await client.post("https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                        json={"model": model, "messages": messages, "temperature": temp, "max_tokens": 700})
+                    if r2.status_code == 200: _groq_model = model; return r2.json()["choices"][0]["message"]["content"]
+                if r.status_code == 429: print(f"[GROQ] {model} rate limit"); continue
                 print(f"[GROQ] {model} — {r.status_code}")
-            except Exception as e:
-                print(f"[GROQ] {model}: {e}"); continue
+            except Exception as e: print(f"[GROQ] {model}: {e}"); continue
     _groq_model = None
     return None
 
 async def call_gemini(messages: list) -> str | None:
     global _gemini_model
-    prompt = "\n".join(
-        f"{'ATLAS' if m['role']=='assistant' else 'KORISNIK'}: {m['content']}"
-        for m in messages if isinstance(m.get("content"), str)
-    )
-    if len(prompt) > 18000:
-        prompt = prompt[-18000:]
-    order = ([_gemini_model] + [m for m in GEMINI_MODELS if m != _gemini_model]
-             if _gemini_model else GEMINI_MODELS)
+    prompt = "\n".join(f"{'ATLAS' if m['role']=='assistant' else 'KORISNIK'}: {m['content']}"
+                       for m in messages if isinstance(m.get("content"), str))
+    if len(prompt) > 18000: prompt = prompt[-18000:]
+    order = ([_gemini_model] + [m for m in GEMINI_MODELS if m != _gemini_model] if _gemini_model else GEMINI_MODELS)
     async with httpx.AsyncClient(timeout=45) as client:
         for model in order:
             try:
                 r = await client.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"{model}:generateContent?key={GEMINI_API_KEY}",
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}",
                     json={"contents": [{"parts": [{"text": prompt}]}]})
                 if r.status_code == 200:
-                    if _gemini_model != model:
-                        print(f"[GEMINI] Aktivan: {model}")
-                        _gemini_model = model
+                    if _gemini_model != model: print(f"[GEMINI] Aktivan: {model}"); _gemini_model = model
                     return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-                if r.status_code == 429:
-                    print(f"[GEMINI] {model} quota"); continue
+                if r.status_code == 429: print(f"[GEMINI] {model} quota"); continue
                 print(f"[GEMINI] {model} — {r.status_code}")
-            except Exception as e:
-                print(f"[GEMINI] {model}: {e}"); continue
+            except Exception as e: print(f"[GEMINI] {model}: {e}"); continue
     _gemini_model = None
     return None
 
 async def call_ai(messages: list, mode: str = "fast") -> tuple:
-    temp = {"fast":0.35,"analysis":0.2,"creative":0.75,"code":0.1,
-            "search":0.1,"url":0.2,"video":0.3,"audio":0.3,"photo":0.3}.get(mode, 0.35)
+    temp = {"fast":0.35,"analysis":0.2,"creative":0.75,"code":0.1,"search":0.3,
+            "url":0.2,"video":0.3,"audio":0.3,"photo":0.3}.get(mode, 0.35)
     out = await call_groq(messages, temp)
     if out: return out, _groq_model or "GROQ"
     out = await call_gemini(messages)
     if out: return out, _gemini_model or "GEMINI"
+    # SAFE FALLBACK — ne vraća "AI nedostupan"
     return "Trenutno ne mogu dohvatiti odgovor. Pokusaj ponovno.", "ERROR"
 
 async def call_vision(image_data: str, prompt: str) -> tuple:
@@ -951,10 +563,8 @@ async def call_vision(image_data: str, prompt: str) -> tuple:
     async with httpx.AsyncClient(timeout=40) as client:
         for model in order:
             try:
-                r = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}",
-                             "Content-Type": "application/json"},
+                r = await client.post("https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
                     json={"model": model, "max_tokens": 900, "temperature": 0.2,
                           "messages": [{"role":"user","content":[
                               {"type":"text","text": prompt or "Analiziraj ovu sliku detaljno."},
@@ -964,22 +574,19 @@ async def call_vision(image_data: str, prompt: str) -> tuple:
                     _vision_model = model
                     return r.json()["choices"][0]["message"]["content"], "GROQ VISION"
                 print(f"[VISION] {model} — {r.status_code}")
-            except Exception as e:
-                print(f"[VISION] {model}: {e}")
+            except Exception as e: print(f"[VISION] {model}: {e}")
     try:
         gem = _gemini_model or GEMINI_MODELS[0]
         async with httpx.AsyncClient(timeout=40) as client:
             r = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{gem}:generateContent?key={GEMINI_API_KEY}",
+                f"https://generativelanguage.googleapis.com/v1beta/models/{gem}:generateContent?key={GEMINI_API_KEY}",
                 json={"contents":[{"parts":[
                     {"text": prompt or "Analiziraj ovu sliku."},
                     {"inline_data":{"mime_type":"image/jpeg","data": b64}}
                 ]}]})
             if r.status_code == 200:
                 return r.json()["candidates"][0]["content"]["parts"][0]["text"], "GEMINI VISION"
-    except Exception as e:
-        print(f"[VISION GEMINI]: {e}")
+    except Exception as e: print(f"[VISION GEMINI]: {e}")
     return "Vision analiza nedostupna.", "ERROR"
 
 async def call_gemini_media(b64: str, mime: str, prompt: str) -> str | None:
@@ -987,8 +594,7 @@ async def call_gemini_media(b64: str, mime: str, prompt: str) -> str | None:
         gem = _gemini_model or GEMINI_MODELS[0]
         async with httpx.AsyncClient(timeout=60) as client:
             r = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{gem}:generateContent?key={GEMINI_API_KEY}",
+                f"https://generativelanguage.googleapis.com/v1beta/models/{gem}:generateContent?key={GEMINI_API_KEY}",
                 json={"contents":[{"parts":[
                     {"text": prompt or "Analiziraj ovaj medijski sadrzaj."},
                     {"inline_data":{"mime_type": mime, "data": b64}}
@@ -996,43 +602,42 @@ async def call_gemini_media(b64: str, mime: str, prompt: str) -> str | None:
             if r.status_code == 200:
                 return r.json()["candidates"][0]["content"]["parts"][0]["text"]
             print(f"[MEDIA GEMINI] {r.status_code}")
-    except Exception as e:
-        print(f"[MEDIA GEMINI] {e}")
+    except Exception as e: print(f"[MEDIA GEMINI] {e}")
     return None
 
 # ══════════════════════════════════════
-# ORCHESTRATOR (safe, timeout, MAX_STEPS)
+# ORCHESTRATOR
 # ══════════════════════════════════════
 async def planner(goal: str, profile: dict, history: list, last_task: dict) -> list:
-    task_ctx = (
-        f"Prethodni zadatak: {last_task.get('goal','')}. "
-        f"Rezultat: {last_task.get('result','')[:200]}"
-        if last_task else ""
-    )
+    task_ctx = f"Prethodni zadatak: {last_task.get('goal','')}. Rezultat: {last_task.get('result','')[:200]}" if last_task else ""
     sys_p = (
-        f"Ti si Planner. Razlozi zadatak na MAKSIMALNO {MAX_AUTO_STEPS} koraka.\n"
+        "Ti si Planner agent. Razlozi zadatak na maksimalno 4 konkretna koraka.\n"
         "Vrati SAMO JSON listu stringova. Bez objasnjenja.\n"
+        "Primjer: [\"Istrazi temu\", \"Napravi kod\", \"Testiraj\", \"Zakljuci\"]\n"
         f"{task_ctx}"
     )
     messages = [{"role":"system","content":sys_p},
                 {"role":"user","content":f"Zadatak: {goal}"}]
     out = await call_groq(messages, 0.2) or await call_gemini(messages)
     try:
-        raw   = re.sub(r"```json?|```", "", out or "[]").strip()
+        raw = re.sub(r"```json?|```", "", out or "[]").strip()
         steps = json.loads(raw)
         if isinstance(steps, list) and steps:
-            return [str(s) for s in steps[:MAX_AUTO_STEPS]]
+            return [str(s) for s in steps[:4]]
     except:
         pass
     return [goal]
 
-async def executor(step: str, goal: str, context: str,
-                   history: list, lang: str) -> str:
+async def executor(step: str, goal: str, context: str, history: list, lang: str) -> str:
     sys_p = (
-        f"Ti si Executor agent unutar ATLAS OS v18.1.\n"
+        "Ti si Executor agent unutar ATLAS OS.\n"
+        "Koristi SAMO main.py — sve je u jednom fajlu.\n"
         f"Cilj: {goal}\n"
-        f"Kontekst dosad: {context[:600] if context else 'Nema'}\n"
-        "FORMAT: STEP 1: konkretna akcija (max 3)"
+        f"Kontekst: {context[:600] if context else 'Nema'}\n\n"
+        "FORMAT ODGOVORA:\n"
+        "STEP 1: konkretna akcija\n"
+        "STEP 2: konkretna akcija\n"
+        "(max 3 STEP-a, vezana za kod i implementaciju)"
     )
     messages = (
         [{"role":"system","content":sys_p}]
@@ -1041,70 +646,59 @@ async def executor(step: str, goal: str, context: str,
     )
     out = await call_groq(messages, 0.3) or await call_gemini(messages)
 
-    # If code block detected — validate + execute
-    code_match = re.search(r'```python\s*(.*?)```', out or "", re.DOTALL)
-    if code_match:
-        code = code_match.group(1).strip()
-        # safe_layer check before exec
-        check = validate_code(code)
-        if not check["safe"]:
-            return f"{out}\n\n[BLOCKED] {check['reason']}"
-        exec_result = tool_run_python(code)
-        # Retry fix if error detected
-        if any(x in exec_result.lower() for x in ["error","exception","traceback","blocked"]):
-            fix_prompt = f"Popravi ovaj Python kod:\n{code}\n\nGreska:\n{exec_result}"
-            fixed_out  = await call_groq([{"role":"user","content":fix_prompt}], 0.2)
-            if fixed_out:
-                m2 = re.search(r'```python\s*(.*?)```', fixed_out, re.DOTALL)
-                if m2:
-                    fixed_code  = m2.group(1).strip()
-                    check2      = validate_code(fixed_code)
-                    exec_result = (tool_run_python(fixed_code) if check2["safe"]
-                                   else f"[BLOCKED] {check2['reason']}")
-        return f"{out}\n\n{exec_result}"
+    # EXECUTION HOOK
+    match_code = re.search(r"""```python(.*?)```""", out or "", re.DOTALL)
+    if match_code:
+        code_block = match_code.group(1).strip()
+        # AUTO FIX LOOP
+    result = await run_python_code(code_block)
 
+    if "[ERROR]" in result:
+        fix_prompt = f"Popravi ovaj Python kod:\n{code_block}\n\nGreska:\n{result}"
+        fixed = await call_groq([{"role":"user","content":fix_prompt}], 0.2) or code_block
+
+        import re
+        m2 = re.search(r"""```python(.*?)```""", fixed or "", re.DOTALL)
+        if m2:
+            fixed_code = m2.group(1).strip()
+            result = await run_python_code(fixed_code)
+
+        return f"{out}\n\n{result}"
     return out or f"Korak '{step}' izveden."
 
 async def critic(goal: str, result: str) -> str:
     sys_p = (
-        "Ti si Critic agent. Spoji rezultate u jedan koncizan finalni odgovor.\n"
-        "Ukloni visak i ponavljanja.\n"
-        "NE analiziraj sam sebe. Vrati SAMO finalni odgovor u 1-2 pasusa."
+        "Ti si Critic agent. Spoji rezultate u jedan finalni odgovor.\n"
+        "Ukloni visak i ponavljanja. Poboljsaj jasnocu.\n"
+        "NE analiziraj. NE kritiziraj.\n"
+        "Vrati SAMO finalni odgovor u 1-2 kompaktna pasusa."
     )
     messages = [{"role":"system","content":sys_p},
                 {"role":"user","content":f"Rezultat:\n{result[:2500]}"}]
     out = await call_groq(messages, 0.2) or await call_gemini(messages)
     return out or result
 
-async def orchestrator(goal: str, profile: dict,
-                       history: list, lang: str) -> tuple:
+async def orchestrator(goal: str, profile: dict, history: list, lang: str) -> tuple:
     print(f"[ORCHESTRATOR] Goal: {goal}")
     last_task = await get_last_task()
-    steps     = await planner(goal, profile, history, last_task)
+    steps = await planner(goal, profile, history, last_task)
     print(f"[PLANNER] Koraci: {steps}")
-    context      = ""
+    context = ""
     step_results = []
-    # Hard timeout + step limit prevents infinite loops
-    try:
-        async with asyncio.timeout(AUTO_TIMEOUT):
-            for i, step in enumerate(steps):
-                if i >= MAX_AUTO_STEPS:
-                    break
-                print(f"[EXECUTOR] Korak {i+1}/{len(steps)}: {step}")
-                result = await executor(step, goal, context, history, lang)
-                step_results.append(f"**{step}**\n{result}")
-                context += f"\n{step}: {result[:300]}"
-    except asyncio.TimeoutError:
-        step_results.append(f"[TIMEOUT] Auto mod prekoracen {AUTO_TIMEOUT}s — zaustavljeno.")
+    for i, step in enumerate(steps):
+        print(f"[EXECUTOR] Korak {i+1}/{len(steps)}: {step}")
+        result = await executor(step, goal, context, history, lang)
+        step_results.append(f"**{step}**\n{result}")
+        context += f"\n{step}: {result[:300]}"
     combined = "\n\n".join(step_results)
-    print("[CRITIC] Sinteza...")
-    final     = await critic(goal, combined)
+    print(f"[CRITIC] Sinteza...")
+    final = await critic(goal, combined)
     await save_task(goal, final)
     model_used = _groq_model or _gemini_model or "GROQ"
     return final, model_used, steps
 
 # ══════════════════════════════════════
-# HTML UI — 100% nepromijenjeno
+# HTML UI — nepromijenjen
 # ══════════════════════════════════════
 HTML = r"""<!DOCTYPE html>
 <html lang="hr">
@@ -1216,7 +810,7 @@ audio.media-preview{width:100%;height:40px}
 <canvas id="cvs"></canvas>
 <div class="ov" id="ov" onclick="closeSb()"></div>
 <aside class="sb" id="sb">
-  <div class="sb-hd"><div class="sb-logo">ATLAS</div><div class="sb-sub">OS v18.1 · IMAGO</div></div>
+  <div class="sb-hd"><div class="sb-logo">ATLAS</div><div class="sb-sub">OS v17.0 · IMAGO</div></div>
   <div class="sb-bd">
     <div class="sb-sec">Sesija</div>
     <div class="si" onclick="newSess()">✦ &nbsp;Nova sesija</div>
@@ -1231,7 +825,7 @@ audio.media-preview{width:100%;height:40px}
     <div class="sb-sec">Autonomija</div>
     <div class="si" onclick="autoHint()">🤖 &nbsp;Auto Mode (auto ...)</div>
   </div>
-  <div class="sb-ft">ATLAS AI OS · Groq + Gemini · v18.1</div>
+  <div class="sb-ft">ATLAS AI OS · Groq + Gemini · v17.0</div>
 </aside>
 <header class="hdr">
   <button onclick="openSb()" style="background:none;border:none;color:var(--acc);font-size:23px;cursor:pointer;line-height:1">☰</button>
@@ -1248,7 +842,7 @@ audio.media-preview{width:100%;height:40px}
   <div class="msg"><div class="mm"><span class="mw atlas">Atlas</span></div>
   <div>Sustav aktivan. Memorija ucitana. Groq + Gemini online.<br>
   <small style="color:var(--mu)">PDF ✓ &nbsp;Slike ✓ &nbsp;Audio ✓ &nbsp;Video ✓ &nbsp;URL ✓ &nbsp;Auto ✓</small></div>
-  <div class="mt">BOOT · v18.1</div></div>
+  <div class="mt">BOOT · v17.0</div></div>
 </div>
 <div id="find">📎 <span id="fname"></span><span onclick="clrF()" style="cursor:pointer;color:var(--rd);margin-left:5px">✕</span></div>
 <div class="izone">
@@ -1265,7 +859,7 @@ let ws,pF=null,typEl=null,cMod='text';
 const MODS={
   text:{label:'Tekst mod',ph:"Pitaj Atlas... ili 'auto [zadatak]' za autonomni mod",cls:''},
   video:{label:'Video obrada',ph:'Montaza, kodeci, FPS, export...',cls:'video',tools:['🎬 Montaza','⚙️ Kodeci','📐 Rezolucija','🎞️ FPS','🔊 Audio sync','📤 Export']},
-  audio:{label:'Audio / Glazba',ph:'Mix, EQ, snimanje, format...',cls:'audio',tools:['🎵 Mix',' 🎤 Snimanje','🔉 EQ','🥁 Ritam','📻 Format','💿 Export']},
+  audio:{label:'Audio / Glazba',ph:'Mix, EQ, snimanje, format...',cls:'audio',tools:['🎵 Mix','🎤 Snimanje','🔉 EQ','🥁 Ritam','📻 Format','💿 Export']},
   photo:{label:'Foto / Slika',ph:'Editing, boja, crop, kompozicija...',cls:'photo',tools:['🖼️ Edit','🎨 Boja','✂️ Crop','💡 Ekspozicija','🔲 Kompozicija','📁 Export']}
 };
 function setMod(m){cMod=m;const cfg=MODS[m];['text','video','audio','photo'].forEach(x=>document.getElementById('m-'+x).classList.toggle('act',x===m));document.getElementById('mlabel').textContent=cfg.label;document.getElementById('inp').placeholder=cfg.ph;const mp=document.getElementById('modp');mp.textContent=m.toUpperCase();mp.className='modp '+(m!=='text'?m:'');document.getElementById('ibox').className='ibox '+cfg.cls;document.getElementById('sbtn').className='ibtn sbtn '+cfg.cls;const bar=document.getElementById('mbar');if(cfg.tools){bar.className='mbar show '+m;bar.innerHTML=cfg.tools.map(t=>`<button class="mbtn" onclick="qp('${t}')">${t}</button>`).join('');}else{bar.className='mbar';bar.innerHTML='';}if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'media_mode',mode:m}));closeSb();}
@@ -1306,21 +900,14 @@ window.onresize=resize;resize();draw();conn();
 # ══════════════════════════════════════
 @app.get("/manifest.json")
 async def manifest():
-    return JSONResponse({
-        "name":"ATLAS OS","short_name":"ATLAS","start_url":"/",
-        "display":"standalone","background_color":"#000","theme_color":"#0ea5e9",
-        "icons":[{"src":"https://cdn-icons-png.flaticon.com/512/714/714390.png",
-                  "sizes":"512x512","type":"image/png"}]
-    })
+    return JSONResponse({"name":"ATLAS OS","short_name":"ATLAS","start_url":"/","display":"standalone",
+                         "background_color":"#000","theme_color":"#0ea5e9",
+                         "icons":[{"src":"https://cdn-icons-png.flaticon.com/512/714/714390.png","sizes":"512x512","type":"image/png"}]})
 
 @app.get("/sw.js")
 async def sw():
-    return HTMLResponse(
-        "self.addEventListener('install',e=>self.skipWaiting());"
-        "self.addEventListener('activate',e=>e.waitUntil(clients.claim()));"
-        "self.addEventListener('fetch',e=>{});",
-        media_type="application/javascript"
-    )
+    return HTMLResponse("self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(clients.claim()));self.addEventListener('fetch',e=>{});",
+                        media_type="application/javascript")
 
 @app.get("/")
 async def home():
@@ -1333,7 +920,7 @@ async def home():
 async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
     await init_db()
-    loop         = asyncio.get_event_loop()
+    loop = asyncio.get_event_loop()
     session_media = "text"
 
     while True:
@@ -1350,20 +937,14 @@ async def ws_endpoint(websocket: WebSocket):
 
             if raw == "__BACKUP__":
                 msg = await loop.run_in_executor(None, run_backup, "")
-                await websocket.send_json({
-                    "message":msg,"model":"SYSTEM","tags":["cloud"],"mode":"fast"
-                }); continue
+                await websocket.send_json({"message":msg,"model":"SYSTEM","tags":["cloud"],"mode":"fast"}); continue
 
             if raw == "__GIT_UPDATE__":
                 msg = await loop.run_in_executor(None, run_git_update)
-                await websocket.send_json({
-                    "message":msg,"model":"SYSTEM","tags":[],"mode":"fast"
-                }); continue
+                await websocket.send_json({"message":msg,"model":"SYSTEM","tags":[],"mode":"fast"}); continue
 
-            try:
-                data = json.loads(raw)
-            except:
-                data = {"text": raw}
+            try: data = json.loads(raw)
+            except: data = {"text": raw}
 
             if data.get("type") == "media_mode":
                 session_media = data.get("mode","text"); continue
@@ -1372,141 +953,110 @@ async def ws_endpoint(websocket: WebSocket):
             file_data  = data.get("file")
             media_mode = data.get("mediaMode", session_media)
 
-            if not user_msg and not file_data:
+            if not user_msg and not file_data: continue
 
+            # ── MODULE SYSTEM ──
+            mod = await handle_modules(user_msg)
+            if mod:
+                await save_msg("user", user_msg)
+                await save_msg("assistant", mod["message"])
+                try: auto_save(user_msg, mod["message"])
+                except: pass
+                await websocket.send_json(mod)
                 continue
 
-            # ── APPROVE TOOL ──
-            if user_msg.lower().startswith("approve:"):
-                tool_name = user_msg.split(":", 1)[-1].strip().lower()
-                if tool_name in REQUIRES_APPROVAL:
-                    approve_tool(tool_name)
-                    await websocket.send_json({
-                        "message": f"✅ Tool '{tool_name}' odobren za ovu sesiju.",
-                        "model": "SYSTEM", "tags": [], "mode": "fast"
-                    }); continue
+            if user_msg: asyncio.create_task(update_profile(user_msg))
 
-            if user_msg:
-                asyncio.create_task(update_profile(user_msg))
             lang = detect_language(user_msg) if user_msg else "hr"
 
-            # ── MEMORY RECALL ──
-            recall_kw = ["sjeti se","memory","što smo pričali","sto smo pricali",
-                         "prethodni razgovor","recall"]
-            if user_msg and any(k in user_msg.lower() for k in recall_kw):
-                query = re.sub(
-                    r'sjeti se|memory|recall|što smo pričali|sto smo pricali|prethodni razgovor',
-                    '', user_msg, flags=re.IGNORECASE
-                ).strip()
+            # ── MEMORY RECALL — "sjeti se" / "memory" ──
+            recall_kw = ["sjeti se", "memory", "što smo pričali", "sto smo pricali",
+                         "prethodni razgovor", "recall"]
+            if any(k in user_msg.lower() for k in recall_kw):
+                # Izvuci opcionalni query iza kljucne rijeci
+                query = re.sub(r'sjeti se|memory|recall|što smo pričali|sto smo pricali|prethodni razgovor', '',
+                               user_msg, flags=re.IGNORECASE).strip()
                 mem_result = recall(query)
                 await save_msg("user", user_msg)
                 await save_msg("assistant", mem_result)
                 await websocket.send_json({
-                    "message": mem_result, "model": "MEMORY",
-                    "tags": [], "mode": "fast"
+                    "message": mem_result,
+                    "model": "MEMORY",
+                    "tags": [],
+                    "mode": "fast"
                 }); continue
 
-            # ── TOOL PRIORITY ──
-            if user_msg:
-                tool_result = handle_tool_request(user_msg)
-                if tool_result is not None:
-                    await save_msg("user", user_msg)
-                    await save_msg("assistant", tool_result)
-                    try: auto_save(user_msg, tool_result)
-                    except: pass
-                    await websocket.send_json({
-                        "message": tool_result, "model": "TOOL",
-                        "tags": ["code"], "mode": "code"
-                    }); continue
-
-            # ── BACKUP TRIGGER ──
-            backup_kw = ["prenesi na oblak","upload na oblak","spremi na oblak",
-                         "prenesi fajl","backup fajl"]
-            if user_msg and any(k in user_msg.lower() for k in backup_kw):
-                fname = _detect_backup_file(user_msg)
-                msg   = await loop.run_in_executor(None, run_backup, fname)
+            # ── TOOL PRIORITY: tool → AI ──
+            tool_result = handle_tool_request(user_msg)
+            if tool_result is not None:
                 await save_msg("user", user_msg)
-                await save_msg("assistant", msg)
-                await websocket.send_json({
-                    "message":msg,"model":"SYSTEM","tags":["cloud"],"mode":"fast"
-                }); continue
+                await save_msg("assistant", tool_result)
+                # auto_save — ne prekida flow
+                try: auto_save(user_msg, tool_result)
+                except: pass
+                await websocket.send_json({"message":tool_result,"model":"TOOL","tags":["code"],"mode":"code"}); continue
 
-            # ── LOCAL MULTIMEDIA PROCESSING ──
-            if file_data and user_msg:
-                media_proc = handle_media_processing(file_data, user_msg)
-                if media_proc:
-                    tag         = media_proc.get("tag","photo")
-                    result_text = media_proc.get("result","")
-                    await save_msg("user", f"[MEDIA_PROC] {user_msg[:150]}")
-                    await save_msg("assistant", result_text)
-                    try: auto_save(f"[MEDIA_PROC] {user_msg}", result_text)
-                    except: pass
-                    await websocket.send_json({
-                        "message": result_text, "model": "LOCAL",
-                        "tags": [tag], "mode": tag
-                    }); continue
+            # ── BACKUP trigger ──
+            backup_kw = ["prenesi na oblak","upload na oblak","spremi na oblak","prenesi fajl","backup fajl"]
+            if any(k in user_msg.lower() for k in backup_kw):
+                fname = _detect_backup_file(user_msg)
+                msg = await loop.run_in_executor(None, run_backup, fname)
+                await save_msg("user", user_msg); await save_msg("assistant", msg)
+                await websocket.send_json({"message":msg,"model":"SYSTEM","tags":["cloud"],"mode":"fast"}); continue
 
-            # ── VISION ──
+            # ── SLIKA → Vision + Preview ──
             if file_data and file_data.get("isImage"):
                 img_data = file_data["data"]
-                preview  = {"type":"image","data":img_data,
-                            "mime":file_data.get("type","image/jpeg")}
+                preview = {"type":"image","data":img_data,"mime":file_data.get("type","image/jpeg")}
                 out, model = await call_vision(img_data, user_msg)
                 await save_msg("user", f"[SLIKA] {user_msg[:150]}")
                 await save_msg("assistant", out)
                 try: auto_save(f"[SLIKA] {user_msg}", out)
                 except: pass
                 await websocket.send_json({
-                    "message":out,"model":model,"tags":["vision"],
-                    "mode":"analysis","preview":preview
+                    "message":out,"model":model,"tags":["vision"],"mode":"analysis",
+                    "preview":preview
                 }); continue
 
-            # ── AUDIO ──
+            # ── AUDIO → Gemini + Preview ──
             if file_data and file_data.get("isAudio"):
                 audio_data = file_data["data"]
                 b64  = audio_data.split(",")[-1] if "," in audio_data else audio_data
                 mime = file_data.get("type","audio/mpeg")
                 preview = {"type":"audio","data":audio_data,"mime":mime}
-                out = await call_gemini_media(
-                    b64, mime, user_msg or "Transkribiraj i analiziraj ovaj audio."
-                )
+                out = await call_gemini_media(b64, mime, user_msg or "Transkribiraj i analiziraj ovaj audio.")
                 resp_text = out or "Audio analiza nedostupna za ovaj format."
                 await save_msg("user", f"[AUDIO] {user_msg[:150]}")
                 await save_msg("assistant", resp_text)
                 try: auto_save(f"[AUDIO] {user_msg}", resp_text)
                 except: pass
                 await websocket.send_json({
-                    "message":resp_text,"model":"GEMINI","tags":["audio"],
-                    "mode":"audio","preview":preview
+                    "message":resp_text,"model":"GEMINI","tags":["audio"],"mode":"audio",
+                    "preview":preview
                 }); continue
 
-            # ── VIDEO ──
+            # ── VIDEO → Gemini + Preview ──
             if file_data and file_data.get("isVideo"):
                 video_data = file_data["data"]
                 b64  = video_data.split(",")[-1] if "," in video_data else video_data
                 mime = file_data.get("type","video/mp4")
                 preview = {"type":"video","data":video_data,"mime":mime}
-                out = await call_gemini_media(
-                    b64, mime, user_msg or "Analiziraj ovaj video sadrzaj."
-                )
+                out = await call_gemini_media(b64, mime, user_msg or "Analiziraj ovaj video sadrzaj.")
                 resp_text = out or "Video analiza nedostupna za ovaj format."
                 await save_msg("user", f"[VIDEO] {user_msg[:150]}")
                 await save_msg("assistant", resp_text)
                 try: auto_save(f"[VIDEO] {user_msg}", resp_text)
                 except: pass
                 await websocket.send_json({
-                    "message":resp_text,"model":"GEMINI","tags":["video"],
-                    "mode":"video","preview":preview
+                    "message":resp_text,"model":"GEMINI","tags":["video"],"mode":"video",
+                    "preview":preview
                 }); continue
 
-            # ── AUTO MODE ──
-            if user_msg and user_msg.lower().startswith("auto "):
+            # ── AUTO MODE → Orchestrator ──
+            if user_msg.lower().startswith("auto "):
                 goal = user_msg[5:].strip()
                 if not goal:
-                    await websocket.send_json({
-                        "message": "Navedi zadatak nakon 'auto '.",
-                        "model": "ATLAS", "tags": [], "mode": "fast"
-                    }); continue
+                    await websocket.send_json({"message":"Navedi zadatak nakon 'auto '.","model":"ATLAS","tags":[],"mode":"fast"}); continue
                 print(f"[AUTO] Goal: {goal}")
                 profile = await get_profile()
                 history = await get_history(6)
@@ -1518,16 +1068,18 @@ async def ws_endpoint(websocket: WebSocket):
                 except: pass
                 await websocket.send_json({
                     "message": out + steps_info,
-                    "model": model, "tags": ["auto"], "mode": "auto"
+                    "model": model,
+                    "tags": ["auto"],
+                    "mode": "auto"
                 }); continue
 
             # ── STANDARDNI FLOW ──
-            mode          = detect_mode(user_msg or "")
-            tags          = []
-            extra_ctx     = ""
-            has_real_data = False
+            mode = detect_mode(user_msg)
+            tags = []
+            extra_ctx = ""
+            has_real_data = False  # za Truth Mode
 
-            # URL reading
+            # URL citanje
             urls = extract_urls(user_msg) if user_msg else []
             if urls:
                 parts = []
@@ -1536,95 +1088,65 @@ async def ws_endpoint(websocket: WebSocket):
                     content, ctype = await fetch_url_content(url)
                     parts.append(f"[SADRZAJ: {url}]\n{content}")
                     tags.append("pdf" if ctype == "pdf" else "url")
-                extra_ctx     = "\n\n" + "\n\n---\n\n".join(parts)
-                mode          = "url"
+                extra_ctx = "\n\n" + "\n\n---\n\n".join(parts)
+                mode = "url"
                 has_real_data = True
 
             elif mode == "search":
-                is_news = any(k in user_msg.lower()
-                              for k in ["vijesti","news","danas","today","trenutno"])
+                is_news = any(k in user_msg.lower() for k in ["vijesti","news","danas","today","trenutno"])
                 web = await loop.run_in_executor(None, _web_search, user_msg, is_news)
                 if web:
-                    # web_fix: inject real web results with anti-hallucination
-                    injected  = inject_web_results(user_msg, web, lang)
                     extra_ctx = f"\n\n[WEB REZULTATI]\n{web}"
                     tags.append("web")
                     has_real_data = True
-                    # Override user_msg for the AI call
-                    user_msg = injected
-                else:
-                    # No web data — inject no-data signal
-                    no_data_msg = inject_web_results(user_msg, "", lang)
-                    await save_msg("user", user_msg)
-                    await save_msg("assistant", no_data_msg)
-                    try: auto_save(user_msg, no_data_msg)
-                    except: pass
-                    await websocket.send_json({
-                        "message": no_data_msg, "model": "ATLAS",
-                        "tags": [], "mode": "search"
-                    }); continue
 
             # PDF upload
             if file_data and file_data.get("isPdf"):
                 fname  = file_data.get("name","dokument.pdf")
                 fdata  = file_data.get("data","")
                 parsed = _parse_file(fname, fdata)
-                extra_ctx    += f"\n\n{parsed}"
+                extra_ctx += f"\n\n{parsed}"
                 tags.append("pdf")
                 has_real_data = True
-            elif file_data and not any(file_data.get(k)
-                                       for k in ["isImage","isAudio","isVideo","isPdf"]):
+            elif file_data and not any(file_data.get(k) for k in ["isImage","isAudio","isVideo","isPdf"]):
                 fname    = file_data.get("name","nepoznato")
                 fcontent = file_data.get("data","")
-                extra_ctx    += f"\n\n{_parse_file(fname, fcontent)}"
+                parsed   = _parse_file(fname, fcontent)
+                extra_ctx += f"\n\n{parsed}"
                 has_real_data = True
 
-            last_task    = await get_last_task()
-            task_context = (
-                f"{last_task.get('goal','')} → {last_task.get('result','')[:150]}"
-                if last_task else ""
-            )
+            last_task = await get_last_task()
+            task_context = f"{last_task.get('goal','')} → {last_task.get('result','')[:150]}" if last_task else ""
+
             profile    = await get_profile()
             history    = await get_history(10)
-            sys_prompt = build_system(
-                profile, mode, lang, media_mode, task_context, has_real_data
-            )
+            # Truth Mode: has_real_data=False → dodaje anti-hallucination pravilo
+            sys_prompt = build_system(profile, mode, lang, media_mode, task_context, has_real_data)
 
-            user_content = user_msg or ""
-            if extra_ctx:
-                user_content = f"{user_content}\n{extra_ctx[:3500]}"
+            user_content = user_msg
+            if extra_ctx: user_content = f"{user_msg}\n{extra_ctx[:3500]}"
 
-            messages = (
-                [{"role":"system","content":sys_prompt}]
-                + history
-                + [{"role":"user","content":user_content}]
-            )
+            messages = [{"role":"system","content":sys_prompt}] + history + [{"role":"user","content":user_content}]
 
             out, model = await call_ai(messages, mode)
-            await save_msg("user", (user_msg or "")[:400])
+
+            await save_msg("user", user_msg[:400])
             await save_msg("assistant", out[:600])
-            try: auto_save(user_msg or "", out)
+
+            # AUTO MEMORY — ne prekida flow
+            try: auto_save(user_msg, out)
             except: pass
 
             if media_mode != "text" and media_mode not in tags:
                 tags.append(media_mode)
 
-            await websocket.send_json({
-                "message": out, "model": model,
-                "tags": tags, "mode": mode
-            })
+            await websocket.send_json({"message":out,"model":model,"tags":tags,"mode":mode})
 
-        except WebSocketDisconnect:
-            break
+        except WebSocketDisconnect: break
         except Exception as e:
             print(f"[ATLAS ERROR] {e}")
-            try:
-                await websocket.send_json({
-                    "error": f"Greska: {str(e)[:150]}",
-                    "tags": [], "mode": "fast"
-                })
-            except:
-                break
+            try: await websocket.send_json({"error":f"Greska: {str(e)[:150]}","tags":[],"mode":"fast"})
+            except: break
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
