@@ -1,3 +1,12 @@
+# ---------------------------------------------------------
+# Project: ATLAS OS v18.5 - IMAGO
+# Author: Iggy-Atlas
+# Year: 2026
+# License: All Rights Reserved / Proprietary
+# Description: Personal AI Operating System for Termux.
+# This software is the intellectual property of Iggy-Atlas.
+# ---------------------------------------------------------
+
 class Orchestrator:
     def __init__(self, planner, executor, critic):
         self.planner = planner

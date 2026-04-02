@@ -1,3 +1,12 @@
+# ---------------------------------------------------------
+# Project: ATLAS OS v18.5 - IMAGO
+# Author: Iggy-Atlas
+# Year: 2026
+# License: All Rights Reserved / Proprietary
+# Description: Personal AI Operating System for Termux.
+# This software is the intellectual property of Iggy-Atlas.
+# ---------------------------------------------------------
+
 def inject_web_results(user_msg: str, web_data: str, lang: str = "hr") -> str:
     if not web_data:
         return "Nema dostupnih web podataka za ovaj upit."
