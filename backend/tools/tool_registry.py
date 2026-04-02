@@ -1,11 +1,12 @@
 # ---------------------------------------------------------
-# Project: ATLAS OS v18.5 - IMAGO
+# Project: ATLAS OS v18.5 - MACHINE (IMAGO)
 # Author: Iggy-Atlas
 # Year: 2026
 # License: All Rights Reserved / Proprietary
 # Description: Personal AI Operating System for Termux.
-# This software is the intellectual property of Iggy-Atlas.
+# Intellectual Property of Iggy-Atlas.
 # ---------------------------------------------------------
+
 
 from .executor_tools import file_write, file_read, run_python, run_shell, list_files
 

@@ -1,17 +1,21 @@
-# ATLAS OS v18.5 — IMAGO
+# 🛰️ ATLAS OS v18.5 — MACHINE Phase (IMAGO)
 
 **Author:** Iggy-Atlas  
-**Version:** 18.5-MACHINE  
-**Status:** Proprietary / All Rights Reserved
+**Status:** Proprietary / All Rights Reserved (2026)
 
-## 🛡️ Intellectual Property Notice
-This project is a personal AI Operating System designed for mobile environments (Termux). All source code, logic structures, and modular architectures contained within this repository are the **intellectual property of Iggy-Atlas**.
+The most advanced stable release of ATLAS OS for the Termux environment. This version transforms a mobile device into an autonomous AI workstation with a focus on modularity, self-healing code, and deep hardware integration.
 
-## 🚀 Overview
-ATLAS OS transforms a mobile device into a high-performance AI workstation, integrating:
-* **Multi-Model Intelligence:** Seamless coordination between Groq (Llama) and Gemini engines.
-* **Modular Architecture:** Specialized modules for Web Scouting, Media Processing, and Long-term Vector Memory.
-* **Self-Healing Code:** Autonomous debugging and simulation capabilities.
+### 🧠 Key Enhancements in v18.5-MACHINE:
+* **Modular Architecture:** Full integration of specialized engines: `web_scout` (live search), `media_pro` (FFmpeg processing), `lingua_core` (tone adaptation), and `vector_brain` (long-term memory).
+* **Cognitive Expansion:** Enhanced context window with RAG (Retrieval-Augmented Generation) capabilities via `context_helper`.
+* **Autonomous Agent System:** Introduction of the Planner-Executor-Critic orchestrator for complex multi-step tasks.
+* **Vision & Media Multi-Core:** Seamless switching between Groq (Llama 3.3/4) and Gemini 2.0 Flash for ultra-fast image, audio, and video analysis.
+* **Security Vault:** Proprietary access control system ensuring safe file operations within the mobile environment.
 
-## ⚠️ Legal Disclaimer
-No part of this software may be reproduced, shared, or repurposed for commercial or public use without explicit authorization from the author.
+### 🛠️ Quick Start:
+1. `git clone https://github.com/Iggy-Atlas/atlas-os-termux`
+2. `pip install -r requirements.txt`
+3. Configure your keys in `.env`
+4. `python main.py`
+
+**Status:** Production Ready / High-Performance AI OS
