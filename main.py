@@ -1,4 +1,3 @@
-from security_agent import analyze_threat, security_response
 import os, uvicorn, httpx, json, asyncio, subprocess, re, base64, io, hashlib, time
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +8,11 @@ import aiosqlite
 
 from safe_layer import validate_code, validate_url, safe_error
 from web_fix import inject_web_results, build_search_system_prompt, has_web_data
+
+# ══════════════════════════════════════
+# ATLAS OS v18.5 — MODULARNI SUSTAV
+# ══════════════════════════════════════
+ATLAS_VERSION = "v18.5"
 
 load_dotenv()
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
@@ -47,6 +51,151 @@ URL_BLACKLIST = [
 ]
 
 # ══════════════════════════════════════
+# SOFT MODULE IMPORTS — sve opcionalno
+# Sustav radi normalno ako moduli ne postoje
+# ══════════════════════════════════════
+_scout   = None
+_media   = None
+_lingua  = None
+_security_vault = None
+_memory_brain   = None
+_context = None
+
+try:
+    import modules.tools.web_scout as _scout
+    print(f"[MODULE] web_scout ucitan")
+except Exception as e:
+    print(f"[MODULE] web_scout nedostupan: {e}")
+
+try:
+    import modules.tools.media_pro as _media
+    print(f"[MODULE] media_pro ucitan")
+except Exception as e:
+    print(f"[MODULE] media_pro nedostupan: {e}")
+
+try:
+    import modules.tools.lingua_core as _lingua
+    print(f"[MODULE] lingua_core ucitan")
+except Exception as e:
+    print(f"[MODULE] lingua_core nedostupan: {e}")
+
+try:
+    import modules.security.vault as _security_vault
+    print(f"[MODULE] security.vault ucitan")
+except Exception as e:
+    print(f"[MODULE] security.vault nedostupan: {e}")
+
+try:
+    import modules.core.vector_brain as _memory_brain
+    print(f"[MODULE] vector_brain ucitan")
+except Exception as e:
+    print(f"[MODULE] vector_brain nedostupan: {e}")
+
+try:
+    import modules.core.context_helper as _context
+    print(f"[MODULE] context_helper ucitan")
+except Exception as e:
+    print(f"[MODULE] context_helper nedostupan: {e}")
+
+# ══════════════════════════════════════
+# MODULE HELPER FUNCTIONS
+# Sve f-je su safe — nikad ne crashaju sustav
+# ══════════════════════════════════════
+
+def _scout_search(query: str) -> str:
+    """Autonomna web pretraga putem web_scout modula."""
+    if not _scout:
+        return ""
+    try:
+        result = _scout.get_live_info(query)
+        if result and isinstance(result, str):
+            return result[:2000]
+        if result and isinstance(result, dict):
+            return json.dumps(result, ensure_ascii=False)[:2000]
+        return ""
+    except Exception as e:
+        print(f"[SCOUT] {e}")
+        return ""
+
+def _lingua_adapt(user_msg: str) -> dict:
+    """Adaptacija jezika/tona putem lingua_core modula."""
+    if not _lingua:
+        return {}
+    try:
+        result = _lingua.adapt_to_user(user_msg)
+        if isinstance(result, dict):
+            return result
+        return {}
+    except Exception as e:
+        print(f"[LINGUA] {e}")
+        return {}
+
+def _vault_check(path: str) -> dict:
+    """Provjera pristupa putanji putem security.vault modula."""
+    if not _security_vault:
+        return {"status": "ALLOWED", "message": ""}
+    try:
+        result = _security_vault.check_access(path)
+        if isinstance(result, dict):
+            return result
+        return {"status": "ALLOWED", "message": ""}
+    except Exception as e:
+        print(f"[VAULT] {e}")
+        return {"status": "ALLOWED", "message": ""}
+
+def _memory_save(user_msg: str, response: str) -> None:
+    """Sprema u vector_brain long-term memoriju."""
+    if not _memory_brain:
+        return
+    try:
+        _memory_brain.save(user_msg, response)
+    except Exception as e:
+        print(f"[VECTOR_BRAIN] save: {e}")
+
+def _memory_recall_vector(query: str) -> str:
+    """Dohvaca iz vector_brain memorije."""
+    if not _memory_brain:
+        return ""
+    try:
+        result = _memory_brain.recall(query)
+        if isinstance(result, str):
+            return result[:1000]
+        if isinstance(result, list):
+            return "\n".join(str(r) for r in result[:5])[:1000]
+        return ""
+    except Exception as e:
+        print(f"[VECTOR_BRAIN] recall: {e}")
+        return ""
+
+def _context_get(user_msg: str) -> str:
+    """Dohvaca RAG kod-kontekst za sistemsku poruku."""
+    if not _context:
+        return ""
+    try:
+        result = _context.get_code_context(user_msg)
+        if isinstance(result, str):
+            return result[:1500]
+        if isinstance(result, dict):
+            return json.dumps(result, ensure_ascii=False)[:1500]
+        return ""
+    except Exception as e:
+        print(f"[CONTEXT] {e}")
+        return ""
+
+def _media_process(action: str, data: dict) -> dict:
+    """Obrada medija putem media_pro modula."""
+    if not _media:
+        return {}
+    try:
+        result = _media.process(action, data)
+        if isinstance(result, dict):
+            return result
+        return {}
+    except Exception as e:
+        print(f"[MEDIA_PRO] {e}")
+        return {}
+
+# ══════════════════════════════════════
 # SECURITY / PERMISSIONS
 # ══════════════════════════════════════
 ALLOWED_CMDS       = ["ls", "pwd", "echo"]
@@ -55,7 +204,7 @@ MAX_MEMORY_ENTRIES = 100
 MAX_AUTO_STEPS     = 4
 AUTO_TIMEOUT       = 30
 REQUIRES_APPROVAL  = {"shell", "python", "file_write", "cloud"}
-MAX_FILE_SIZE_B64  = 10 * 1024 * 1024  # 10MB base64
+MAX_FILE_SIZE_B64  = 10 * 1024 * 1024
 
 _approved_tools: set = set()
 
@@ -69,10 +218,18 @@ def blocked(tool: str) -> str:
     return f"[BLOCKED] Permission required for: {tool}. Send 'approve:{tool}' to enable."
 
 def safe_path(path: str) -> Path | None:
+    """Provjera putanje — za putanje izvan PROJECT_DIR koristi vault."""
     try:
         full = (PROJECT_DIR / path.lstrip("/")).resolve()
-        if not str(full).startswith(str(PROJECT_DIR.resolve())):
-            return None
+        is_inside = str(full).startswith(str(PROJECT_DIR.resolve()))
+        if not is_inside:
+            vault_result = _vault_check(str(full))
+            status = vault_result.get("status", "DENIED")
+            if status == "PENDING":
+                print(f"[VAULT] PENDING za putanju: {full}")
+                return None
+            if status != "ALLOWED":
+                return None
         return full
     except:
         return None
@@ -161,8 +318,22 @@ def auto_save(user_msg: str, ai_response: str) -> None:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[AUTO_MEMORY] {e}")
+    # Vector brain save — opcionalno
+    try:
+        _memory_save(user_msg, ai_response)
+    except Exception as e:
+        print(f"[VECTOR_BRAIN_SAVE] {e}")
 
 def recall(query: str = "") -> str:
+    # Pokusaj vector brain prvo
+    if _memory_brain:
+        try:
+            vr = _memory_recall_vector(query)
+            if vr:
+                return f"[Vektorska memorija]\n{vr}"
+        except Exception as e:
+            print(f"[VECTOR_RECALL] {e}")
+    # Fallback na JSON memoriju
     try:
         if not AUTO_MEMORY_PATH.exists():
             return "Memorija je prazna."
@@ -329,6 +500,16 @@ async def get_profile() -> dict:
 # LANGUAGE & MODE
 # ══════════════════════════════════════
 def detect_language(text: str) -> str:
+    # Pokusaj lingua_core prvo
+    if _lingua:
+        try:
+            adapt = _lingua_adapt(text)
+            lang = adapt.get("lang","")
+            if lang in ("hr","en","de","fr","es"):
+                return lang
+        except Exception as e:
+            print(f"[LINGUA_LANG] {e}")
+    # Fallback na interni detektor
     t = text.lower()
     scores = {
         "hr": sum(1 for w in ["što","kako","zašto","gdje","kada","imam","treba",
@@ -371,7 +552,7 @@ def tool_file_write(path: str, content: str) -> str:
         return blocked("file_write")
     full = safe_path(path)
     if not full:
-        return safe_error("Path traversal blocked", "file_write")
+        return safe_error("Path traversal blocked or vault PENDING", "file_write")
     try:
         full.parent.mkdir(parents=True, exist_ok=True)
         full.write_text(content, encoding="utf-8")
@@ -382,7 +563,7 @@ def tool_file_write(path: str, content: str) -> str:
 def tool_file_read(path: str) -> str:
     full = safe_path(path)
     if not full:
-        return safe_error("Path traversal blocked", "file_read")
+        return safe_error("Path traversal blocked or vault PENDING", "file_read")
     try:
         return f"[TOOL] {path}:\n{full.read_text(encoding='utf-8')[:3000]}"
     except Exception as e:
@@ -391,7 +572,7 @@ def tool_file_read(path: str) -> str:
 def tool_list_files(path: str = ".") -> str:
     full = safe_path(path)
     if not full:
-        return safe_error("Path traversal blocked", "list_files")
+        return safe_error("Path traversal blocked or vault PENDING", "list_files")
     try:
         files = [f.name for f in full.iterdir()]
         return f"[TOOL] Fajlovi u {path}:\n" + "\n".join(files[:50])
@@ -401,12 +582,9 @@ def tool_list_files(path: str = ".") -> str:
 def tool_run_python(code: str) -> str:
     if not check_permission("python"):
         return blocked("python")
-
-    # safe_layer validation
     check = validate_code(code)
     if not check["safe"]:
         return safe_error(check["reason"], "python")
-
     allowed_builtins = {
         "print": print, "len": len, "range": range,
         "str": str, "int": int, "float": float,
@@ -455,7 +633,7 @@ def tool_cloud_upload(filepath: str) -> str:
         return blocked("cloud")
     full = safe_path(filepath)
     if not full:
-        return safe_error("Path traversal blocked", "cloud")
+        return safe_error("Path traversal blocked or vault PENDING", "cloud")
     if not full.exists():
         return safe_error(f"File not found: {filepath}", "cloud")
     try:
@@ -520,6 +698,14 @@ def _safe_b64_decode(b64: str) -> bytes | None:
         return None
 
 def process_image_meta(b64: str, mime: str) -> dict:
+    # Pokusaj media_pro modul
+    if _media:
+        try:
+            result = _media_process("image_meta", {"b64": b64, "mime": mime})
+            if result:
+                return result
+        except Exception as e:
+            print(f"[MEDIA_PRO image_meta] {e}")
     try:
         from PIL import Image
         raw = _safe_b64_decode(b64)
@@ -535,6 +721,13 @@ def process_image_meta(b64: str, mime: str) -> dict:
         return {"error": str(e)[:100]}
 
 def process_image_resize(b64: str, mime: str, max_px: int = 1024) -> str:
+    if _media:
+        try:
+            result = _media_process("image_resize", {"b64": b64, "mime": mime, "max_px": max_px})
+            if result and "b64" in result:
+                return result["b64"]
+        except Exception as e:
+            print(f"[MEDIA_PRO image_resize] {e}")
     try:
         from PIL import Image
         raw = _safe_b64_decode(b64)
@@ -550,6 +743,13 @@ def process_image_resize(b64: str, mime: str, max_px: int = 1024) -> str:
         return b64
 
 def process_image_convert(b64: str, target_fmt: str = "jpeg") -> tuple:
+    if _media:
+        try:
+            result = _media_process("image_convert", {"b64": b64, "target_fmt": target_fmt})
+            if result and "b64" in result:
+                return result["b64"], result.get("mime", f"image/{target_fmt}")
+        except Exception as e:
+            print(f"[MEDIA_PRO image_convert] {e}")
     try:
         from PIL import Image
         raw = _safe_b64_decode(b64)
@@ -567,6 +767,13 @@ def process_image_convert(b64: str, target_fmt: str = "jpeg") -> tuple:
         return b64, f"image/{target_fmt}"
 
 def process_audio_meta(b64: str, mime: str, filename: str = "") -> dict:
+    if _media:
+        try:
+            result = _media_process("audio_meta", {"b64": b64, "mime": mime, "filename": filename})
+            if result:
+                return result
+        except Exception as e:
+            print(f"[MEDIA_PRO audio_meta] {e}")
     import struct
     ext = filename.split(".")[-1].lower() if "." in filename else mime.split("/")[-1]
     raw = _safe_b64_decode(b64)
@@ -589,6 +796,13 @@ def process_audio_meta(b64: str, mime: str, filename: str = "") -> dict:
     return info
 
 def process_video_meta(b64: str, mime: str, filename: str = "") -> dict:
+    if _media:
+        try:
+            result = _media_process("video_meta", {"b64": b64, "mime": mime, "filename": filename})
+            if result:
+                return result
+        except Exception as e:
+            print(f"[MEDIA_PRO video_meta] {e}")
     ext = filename.split(".")[-1].lower() if "." in filename else mime.split("/")[-1]
     raw = _safe_b64_decode(b64)
     if not raw:
@@ -649,11 +863,9 @@ def extract_urls(text: str) -> list:
     return [u for u in found if not any(b in u for b in URL_BLACKLIST)]
 
 async def fetch_url_content(url: str) -> tuple:
-    # safe_layer URL validation
     url_check = validate_url(url)
     if not url_check["safe"]:
         return f"[BLOCKED] {url_check['reason']}", "error"
-
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/pdf,*/*;q=0.9"
@@ -715,7 +927,7 @@ def _parse_file(name: str, content: str) -> str:
     return f"[Fajl: {name}]\n{content[:3000]}"
 
 # ══════════════════════════════════════
-# WEB SEARCH (safe + cached)
+# WEB SEARCH (safe + cached + scout fallback)
 # ══════════════════════════════════════
 def _sanitize_query(query: str) -> str:
     query = re.sub(r'[<>&"\']', '', query)
@@ -729,6 +941,8 @@ def _web_search(query: str, news: bool = False) -> str:
     cached = _search_cache_get(cache_key)
     if cached:
         return cached
+
+    # Primarno DuckDuckGo
     try:
         from duckduckgo_search import DDGS
         with DDGS() as ddgs:
@@ -745,11 +959,19 @@ def _web_search(query: str, news: bool = False) -> str:
                     f"• {r['title']}: {re.sub(r'<[^>]+>',' ',r['body'])[:200]}"
                     for r in results
                 )
-        _search_cache_set(cache_key, out)
-        return out
+        if out:
+            _search_cache_set(cache_key, out)
+            return out
     except Exception as e:
-        print(f"[SEARCH] {e}")
-        return ""
+        print(f"[SEARCH DDG] {e}")
+
+    # Fallback na web_scout modul
+    scout_result = _scout_search(query)
+    if scout_result:
+        _search_cache_set(cache_key, scout_result)
+        return scout_result
+
+    return ""
 
 # ══════════════════════════════════════
 # BACKUP & GIT
@@ -760,7 +982,7 @@ def run_backup(filepath: str = "") -> str:
             return blocked("cloud")
         full = safe_path(filepath)
         if not full:
-            return safe_error("Path traversal blocked", "backup")
+            return safe_error("Path traversal blocked or vault PENDING", "backup")
         if not full.exists():
             return f"Fajl nije pronaden: {filepath}"
         try:
@@ -770,9 +992,9 @@ def run_backup(filepath: str = "") -> str:
             )
             return (f"Fajl prenesen: {full.name}" if result.returncode == 0
                     else f"rclone greska: {result.stderr[:200]}")
-        except FileNotFoundError:    return "rclone nije instaliran."
+        except FileNotFoundError:         return "rclone nije instaliran."
         except subprocess.TimeoutExpired: return "Backup timeout."
-        except Exception as e:       return f"Backup greska: {str(e)[:100]}"
+        except Exception as e:            return f"Backup greska: {str(e)[:100]}"
     try:
         result = subprocess.run(
             ["python", "cloud_backup.py"],
@@ -805,10 +1027,10 @@ def run_git_update() -> str:
         return f"Git greska: {e}"
 
 # ══════════════════════════════════════
-# SYSTEM PROMPT
+# SYSTEM PROMPT (s RAG kontekstom)
 # ══════════════════════════════════════
 LANG_RULES = {
-    "hr": "Jezik: standardni hrvatski knjizevni. Gramaticki ispravno.",
+    "hr": "Jezik: standardni hrvatski knjizevni. Gramaticki ispravno. Bez ijekavice.",
     "en": "Language: fluent, natural English.",
     "de": "Sprache: fließendes, natürliches Deutsch.",
     "fr": "Langue: français courant et naturel.",
@@ -831,7 +1053,8 @@ TRUTH_MODE_RULE = (
 )
 
 def build_system(profile: dict, mode: str, lang: str, media_mode: str,
-                 task_context: str = "", has_real_data: bool = False) -> str:
+                 task_context: str = "", has_real_data: bool = False,
+                 rag_context: str = "", lingua_hints: dict = None) -> str:
     name     = profile.get("name","")
     prefs    = profile.get("preferences",[])
     projects = profile.get("projects",[])
@@ -839,19 +1062,37 @@ def build_system(profile: dict, mode: str, lang: str, media_mode: str,
     if name:     user_ctx += f"Korisnik: {name}. "
     if prefs:    user_ctx += f"Interesi: {', '.join(prefs[:4])}. "
     if projects: user_ctx += f"Projekti: {', '.join(projects[:3])}. "
-    media_ctx = f" MULTIMEDIJSKI MOD: {media_mode.upper()}." if media_mode != "text" else ""
-    task_ctx  = f"\nPRETHODNI ZADATAK: {task_context}" if task_context else ""
-    truth_ctx = f"\n{TRUTH_MODE_RULE}" if not has_real_data else ""
-    # For search mode, append explicit search constraint
+    media_ctx    = f" MULTIMEDIJSKI MOD: {media_mode.upper()}." if media_mode != "text" else ""
+    task_ctx     = f"\nPRETHODNI ZADATAK: {task_context}" if task_context else ""
+    truth_ctx    = f"\n{TRUTH_MODE_RULE}" if not has_real_data else ""
     search_addon = f"\n{build_search_system_prompt(lang)}" if mode == "search" else ""
+    # RAG kontekst — ubaci ako postoji
+    rag_addon = f"\n[RAG KONTEKST DATOTEKA]\n{rag_context[:1200]}" if rag_context else ""
+    # Lingua hints — ton adaptacija
+    tone_hint = ""
+    if lingua_hints:
+        tone = lingua_hints.get("tone","")
+        if tone:
+            tone_hint = f"\nTON: {tone}"
+    # Modules status
+    modules_active = []
+    if _scout:   modules_active.append("web_scout")
+    if _media:   modules_active.append("media_pro")
+    if _lingua:  modules_active.append("lingua_core")
+    if _context: modules_active.append("context_helper")
+    if _memory_brain: modules_active.append("vector_brain")
+    if _security_vault: modules_active.append("vault")
+    mod_str = f"\nAKTIVNI MODULI: {', '.join(modules_active)}" if modules_active else ""
+
     return (
-        f"Ti si ATLAS — napredni AI operativni sustav. v18.1{media_ctx}\n"
+        f"Ti si ATLAS — napredni AI operativni sustav. {ATLAS_VERSION}{media_ctx}\n"
         f"MOD: {mode.upper()} — {MODE_INSTRUCTIONS.get(mode, MODE_INSTRUCTIONS['fast'])}\n"
         f"{LANG_RULES.get(lang, LANG_RULES['hr'])}\n"
-        f"KARAKTER: Direktan. Iskren. Bez laskanja. Bez 'Naravno!' i slicnih fraza.\n"
+        f"KARAKTER: Direktan. Iskren. Neutralan i profesionalan. Ton prilagodjen korisniku. "
+        f"Bez laskanja. Bez 'Naravno!' i slicnih fraza.\n"
         f"SPOSOBNOSTI: Citas URL-ove i PDF-ove. Web pretraga. Cloud backup. Multimedija. Pamtis razgovor.\n"
         + (f"PROFIL: {user_ctx}\n" if user_ctx else "")
-        + task_ctx + truth_ctx + search_addon + "\n"
+        + task_ctx + truth_ctx + search_addon + rag_addon + tone_hint + mod_str + "\n"
         + "Kod u blokovima. Tablice u markdown formatu."
     )
 
@@ -1010,7 +1251,8 @@ async def planner(goal: str, profile: dict, history: list, last_task: dict) -> l
         if last_task else ""
     )
     sys_p = (
-        f"Ti si Planner. Razlozi zadatak na MAKSIMALNO {MAX_AUTO_STEPS} koraka.\n"
+        f"Ti si Planner unutar ATLAS OS {ATLAS_VERSION}. "
+        f"Razlozi zadatak na MAKSIMALNO {MAX_AUTO_STEPS} koraka.\n"
         "Vrati SAMO JSON listu stringova. Bez objasnjenja.\n"
         f"{task_ctx}"
     )
@@ -1029,7 +1271,7 @@ async def planner(goal: str, profile: dict, history: list, last_task: dict) -> l
 async def executor(step: str, goal: str, context: str,
                    history: list, lang: str) -> str:
     sys_p = (
-        f"Ti si Executor agent unutar ATLAS OS v18.1.\n"
+        f"Ti si Executor agent unutar ATLAS OS {ATLAS_VERSION}.\n"
         f"Cilj: {goal}\n"
         f"Kontekst dosad: {context[:600] if context else 'Nema'}\n"
         "FORMAT: STEP 1: konkretna akcija (max 3)"
@@ -1041,16 +1283,13 @@ async def executor(step: str, goal: str, context: str,
     )
     out = await call_groq(messages, 0.3) or await call_gemini(messages)
 
-    # If code block detected — validate + execute
     code_match = re.search(r'```python\s*(.*?)```', out or "", re.DOTALL)
     if code_match:
-        code = code_match.group(1).strip()
-        # safe_layer check before exec
+        code  = code_match.group(1).strip()
         check = validate_code(code)
         if not check["safe"]:
             return f"{out}\n\n[BLOCKED] {check['reason']}"
         exec_result = tool_run_python(code)
-        # Retry fix if error detected
         if any(x in exec_result.lower() for x in ["error","exception","traceback","blocked"]):
             fix_prompt = f"Popravi ovaj Python kod:\n{code}\n\nGreska:\n{exec_result}"
             fixed_out  = await call_groq([{"role":"user","content":fix_prompt}], 0.2)
@@ -1079,12 +1318,11 @@ async def critic(goal: str, result: str) -> str:
 async def orchestrator(goal: str, profile: dict,
                        history: list, lang: str) -> tuple:
     print(f"[ORCHESTRATOR] Goal: {goal}")
-    last_task = await get_last_task()
-    steps     = await planner(goal, profile, history, last_task)
+    last_task    = await get_last_task()
+    steps        = await planner(goal, profile, history, last_task)
     print(f"[PLANNER] Koraci: {steps}")
     context      = ""
     step_results = []
-    # Hard timeout + step limit prevents infinite loops
     try:
         async with asyncio.timeout(AUTO_TIMEOUT):
             for i, step in enumerate(steps):
@@ -1096,15 +1334,15 @@ async def orchestrator(goal: str, profile: dict,
                 context += f"\n{step}: {result[:300]}"
     except asyncio.TimeoutError:
         step_results.append(f"[TIMEOUT] Auto mod prekoracen {AUTO_TIMEOUT}s — zaustavljeno.")
-    combined = "\n\n".join(step_results)
+    combined   = "\n\n".join(step_results)
     print("[CRITIC] Sinteza...")
-    final     = await critic(goal, combined)
+    final      = await critic(goal, combined)
     await save_task(goal, final)
     model_used = _groq_model or _gemini_model or "GROQ"
     return final, model_used, steps
 
 # ══════════════════════════════════════
-# HTML UI — 100% nepromijenjeno
+# HTML UI — v18.5 s Settings panelom
 # ══════════════════════════════════════
 HTML = r"""<!DOCTYPE html>
 <html lang="hr">
@@ -1137,6 +1375,16 @@ body{background:var(--bg);color:var(--tx);font-family:'Syne',sans-serif;display:
 .sb-ft{padding:12px;border-top:1px solid var(--br);font-size:9px;color:var(--mu);letter-spacing:.07em}
 .ov{display:none;position:fixed;inset:0;z-index:199;background:rgba(0,0,0,.65);backdrop-filter:blur(2px)}
 .ov.on{display:block}
+/* Settings panel */
+.sett-panel{display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:290px;background:rgba(4,8,18,.98);border:1px solid var(--br);border-radius:16px;z-index:300;padding:20px;backdrop-filter:blur(24px)}
+.sett-panel.open{display:block}
+.sett-title{font-family:'Orbitron';color:var(--acc);font-size:13px;letter-spacing:.1em;margin-bottom:14px;display:flex;justify-content:space-between;align-items:center}
+.sett-close{cursor:pointer;color:var(--mu);font-size:18px;line-height:1}
+.sett-sec{font-size:9px;color:var(--mu);letter-spacing:.1em;text-transform:uppercase;margin:10px 0 5px}
+.sett-row{display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid rgba(30,41,59,.6)}
+.sett-label{font-size:12px;color:var(--tx)}
+.sett-select{background:var(--sf);border:1px solid var(--br);color:var(--tx);padding:3px 7px;border-radius:6px;font-size:11px;font-family:'Syne',sans-serif}
+.sett-btn{margin-top:14px;width:100%;padding:9px;background:var(--acc);color:#000;border:none;border-radius:9px;font-family:'Orbitron';font-size:11px;letter-spacing:.07em;cursor:pointer}
 .hdr{padding:10px 13px;background:rgba(0,0,0,.9);border-bottom:1px solid var(--br);display:flex;align-items:center;gap:9px;z-index:10;flex-shrink:0;backdrop-filter:blur(12px)}
 .hdr-logo{font-family:'Orbitron';color:var(--acc);font-size:12px;letter-spacing:.1em;text-shadow:0 0 10px rgba(14,165,233,.4);line-height:1.2}
 .hdr-sub{font-size:9px;color:var(--mu);letter-spacing:.05em}
@@ -1215,8 +1463,49 @@ audio.media-preview{width:100%;height:40px}
 <body>
 <canvas id="cvs"></canvas>
 <div class="ov" id="ov" onclick="closeSb()"></div>
+
+<!-- Settings Panel -->
+<div class="sett-panel" id="sett">
+  <div class="sett-title">
+    <span>⚙ POSTAVKE</span>
+    <span class="sett-close" onclick="closeSett()">✕</span>
+  </div>
+  <div class="sett-sec">Jezik sučelja</div>
+  <div class="sett-row">
+    <span class="sett-label">Jezik odgovora</span>
+    <select class="sett-select" id="sett-lang" onchange="applyLang()">
+      <option value="auto">Auto (detekcija)</option>
+      <option value="hr">Hrvatski</option>
+      <option value="en">English</option>
+      <option value="de">Deutsch</option>
+      <option value="fr">Français</option>
+      <option value="es">Español</option>
+    </select>
+  </div>
+  <div class="sett-sec">Mod rada</div>
+  <div class="sett-row">
+    <span class="sett-label">Defaultni mod</span>
+    <select class="sett-select" id="sett-mode" onchange="applyMode()">
+      <option value="fast">Fast (brzi)</option>
+      <option value="analysis">Analysis</option>
+      <option value="code">Code</option>
+      <option value="creative">Creative</option>
+    </select>
+  </div>
+  <div class="sett-sec">Sustav</div>
+  <div class="sett-row">
+    <span class="sett-label">Verzija</span>
+    <span style="font-size:11px;color:var(--acc)">v18.5</span>
+  </div>
+  <div class="sett-row">
+    <span class="sett-label">Moduli</span>
+    <span id="sett-mods" style="font-size:10px;color:var(--mu)">Ucitavam...</span>
+  </div>
+  <button class="sett-btn" onclick="closeSett()">PRIMIJENI</button>
+</div>
+
 <aside class="sb" id="sb">
-  <div class="sb-hd"><div class="sb-logo">ATLAS</div><div class="sb-sub">OS v18.1 · IMAGO</div></div>
+  <div class="sb-hd"><div class="sb-logo">ATLAS</div><div class="sb-sub">OS v18.5 · IMAGO</div></div>
   <div class="sb-bd">
     <div class="sb-sec">Sesija</div>
     <div class="si" onclick="newSess()">✦ &nbsp;Nova sesija</div>
@@ -1230,8 +1519,10 @@ audio.media-preview{width:100%;height:40px}
     <div class="si pm"  id="m-photo" onclick="setMod('photo')">📷 &nbsp;Foto / Slika</div>
     <div class="sb-sec">Autonomija</div>
     <div class="si" onclick="autoHint()">🤖 &nbsp;Auto Mode (auto ...)</div>
+    <div class="sb-sec">Postavke</div>
+    <div class="si" onclick="openSett()">⚙ &nbsp;Settings</div>
   </div>
-  <div class="sb-ft">ATLAS AI OS · Groq + Gemini · v18.1</div>
+  <div class="sb-ft">ATLAS AI OS · Groq + Gemini · v18.5</div>
 </aside>
 <header class="hdr">
   <button onclick="openSb()" style="background:none;border:none;color:var(--acc);font-size:23px;cursor:pointer;line-height:1">☰</button>
@@ -1247,8 +1538,8 @@ audio.media-preview{width:100%;height:40px}
 <div class="chat" id="chat">
   <div class="msg"><div class="mm"><span class="mw atlas">Atlas</span></div>
   <div>Sustav aktivan. Memorija ucitana. Groq + Gemini online.<br>
-  <small style="color:var(--mu)">PDF ✓ &nbsp;Slike ✓ &nbsp;Audio ✓ &nbsp;Video ✓ &nbsp;URL ✓ &nbsp;Auto ✓</small></div>
-  <div class="mt">BOOT · v18.1</div></div>
+  <small style="color:var(--mu)">PDF ✓ &nbsp;Slike ✓ &nbsp;Audio ✓ &nbsp;Video ✓ &nbsp;URL ✓ &nbsp;Auto ✓ &nbsp;v18.5</small></div>
+  <div class="mt">BOOT · v18.5</div></div>
 </div>
 <div id="find">📎 <span id="fname"></span><span onclick="clrF()" style="cursor:pointer;color:var(--rd);margin-left:5px">✕</span></div>
 <div class="izone">
@@ -1261,7 +1552,7 @@ audio.media-preview{width:100%;height:40px}
   </div>
 </div>
 <script>
-let ws,pF=null,typEl=null,cMod='text';
+let ws,pF=null,typEl=null,cMod='text',forceLang=null;
 const MODS={
   text:{label:'Tekst mod',ph:"Pitaj Atlas... ili 'auto [zadatak]' za autonomni mod",cls:''},
   video:{label:'Video obrada',ph:'Montaza, kodeci, FPS, export...',cls:'video',tools:['🎬 Montaza','⚙️ Kodeci','📐 Rezolucija','🎞️ FPS','🔊 Audio sync','📤 Export']},
@@ -1271,6 +1562,10 @@ const MODS={
 function setMod(m){cMod=m;const cfg=MODS[m];['text','video','audio','photo'].forEach(x=>document.getElementById('m-'+x).classList.toggle('act',x===m));document.getElementById('mlabel').textContent=cfg.label;document.getElementById('inp').placeholder=cfg.ph;const mp=document.getElementById('modp');mp.textContent=m.toUpperCase();mp.className='modp '+(m!=='text'?m:'');document.getElementById('ibox').className='ibox '+cfg.cls;document.getElementById('sbtn').className='ibtn sbtn '+cfg.cls;const bar=document.getElementById('mbar');if(cfg.tools){bar.className='mbar show '+m;bar.innerHTML=cfg.tools.map(t=>`<button class="mbtn" onclick="qp('${t}')">${t}</button>`).join('');}else{bar.className='mbar';bar.innerHTML='';}if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'media_mode',mode:m}));closeSb();}
 function autoHint(){closeSb();document.getElementById('inp').value='auto ';document.getElementById('inp').focus();}
 function qp(t){document.getElementById('inp').value=t.replace(/\p{Emoji}/gu,'').trim()+': ';document.getElementById('inp').focus();}
+function openSett(){closeSb();document.getElementById('sett').classList.add('open');document.getElementById('ov').classList.add('on');fetch('/modules_status').then(r=>r.json()).then(d=>{document.getElementById('sett-mods').textContent=d.modules||'N/A';}).catch(()=>{document.getElementById('sett-mods').textContent='N/A';});}
+function closeSett(){document.getElementById('sett').classList.remove('open');document.getElementById('ov').classList.remove('on');}
+function applyLang(){const v=document.getElementById('sett-lang').value;forceLang=v==='auto'?null:v;if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'set_lang',lang:forceLang}));}
+function applyMode(){const v=document.getElementById('sett-mode').value;if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'set_mode',mode:v}));}
 function conn(){ws=new WebSocket('ws://'+location.host+'/ws');ws.onopen=()=>setWs(true);ws.onclose=()=>{setWs(false);setTimeout(conn,2500);};ws.onmessage=e=>{const d=JSON.parse(e.data);if(d.type==='metrics'){document.getElementById('cpu').textContent=d.data.cpu;document.getElementById('mem').textContent=d.data.mem;return;}rmTyp();if(d.action==='reload'){location.reload();return;}if(d.message)addMsg('atlas',d.message,d.model,d.tags||[],d.mode||'',d.preview||null);if(d.error)addMsg('error',d.error,null,[],'',null);};}
 function setWs(on){document.getElementById('wdot').className='wdot '+(on?'on':'off');}
 function setPill(model){if(!model)return;const el=document.getElementById('mpill');el.textContent=model.split(' ')[0];const m=model.toLowerCase();el.className='mpill '+(m.includes('gemini')?'gemini':m.includes('error')?'error':'groq');}
@@ -1280,7 +1575,7 @@ function rmTyp(){if(typEl){typEl.remove();typEl=null;}}
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');}
 function ar(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,100)+'px';}
 function hk(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}}
-function send(){const inp=document.getElementById('inp');const txt=inp.value.trim();if(!txt&&!pF)return;const chat=document.getElementById('chat');const d=document.createElement('div');d.className='msg user';let prevHTML='';if(pF){if(pF.isImage)prevHTML=`<img class="media-preview" src="${pF.data}" alt="${pF.name}">`;else if(pF.isVideo)prevHTML=`<video class="media-preview" controls><source src="${pF.data}" type="${pF.type}"></video>`;else if(pF.isAudio)prevHTML=`<audio class="media-preview" controls><source src="${pF.data}" type="${pF.type}"></audio>`;else prevHTML=`<div class="fbg">📎 ${pF.name}</div>`;}d.innerHTML=`<div class="mm"><span class="mw user">Ti</span></div>${prevHTML}<div>${esc(txt)}</div>`;chat.appendChild(d);chat.scrollTop=chat.scrollHeight;showTyp();ws.send(JSON.stringify({text:txt,file:pF,mediaMode:cMod}));inp.value='';inp.style.height='auto';clrF();}
+function send(){const inp=document.getElementById('inp');const txt=inp.value.trim();if(!txt&&!pF)return;const chat=document.getElementById('chat');const d=document.createElement('div');d.className='msg user';let prevHTML='';if(pF){if(pF.isImage)prevHTML=`<img class="media-preview" src="${pF.data}" alt="${pF.name}">`;else if(pF.isVideo)prevHTML=`<video class="media-preview" controls><source src="${pF.data}" type="${pF.type}"></video>`;else if(pF.isAudio)prevHTML=`<audio class="media-preview" controls><source src="${pF.data}" type="${pF.type}"></audio>`;else prevHTML=`<div class="fbg">📎 ${pF.name}</div>`;}d.innerHTML=`<div class="mm"><span class="mw user">Ti</span></div>${prevHTML}<div>${esc(txt)}</div>`;chat.appendChild(d);chat.scrollTop=chat.scrollHeight;showTyp();ws.send(JSON.stringify({text:txt,file:pF,mediaMode:cMod,forceLang:forceLang}));inp.value='';inp.style.height='auto';clrF();}
 function onFile(input){const file=input.files[0];if(!file)return;const ext=file.name.split('.').pop().toLowerCase();const isImg=file.type.startsWith('image/');const isPdf=ext==='pdf'||file.type==='application/pdf';const isAudio=file.type.startsWith('audio/')||['mp3','wav','ogg','flac','m4a','aac'].includes(ext);const isVideo=file.type.startsWith('video/')||['mp4','mkv','avi','mov','webm'].includes(ext);const reader=new FileReader();reader.onload=e=>{pF={name:file.name,type:file.type,data:e.target.result,isImage:isImg,isPdf:isPdf,isAudio:isAudio,isVideo:isVideo,ext:ext};document.getElementById('find').style.display='block';document.getElementById('fname').textContent=file.name;};if(isImg||isPdf||isAudio||isVideo)reader.readAsDataURL(file);else reader.readAsText(file);}
 function clrF(){pF=null;document.getElementById('find').style.display='none';document.getElementById('fi').value='';}
 function openSb(){document.getElementById('sb').classList.add('open');document.getElementById('ov').classList.add('on');}
@@ -1302,7 +1597,7 @@ window.onresize=resize;resize();draw();conn();
 </html>"""
 
 # ══════════════════════════════════════
-# PWA
+# PWA + MODULES STATUS ENDPOINT
 # ══════════════════════════════════════
 @app.get("/manifest.json")
 async def manifest():
@@ -1322,6 +1617,21 @@ async def sw():
         media_type="application/javascript"
     )
 
+@app.get("/modules_status")
+async def modules_status():
+    active = []
+    if _scout:          active.append("web_scout")
+    if _media:          active.append("media_pro")
+    if _lingua:         active.append("lingua_core")
+    if _security_vault: active.append("vault")
+    if _memory_brain:   active.append("vector_brain")
+    if _context:        active.append("context_helper")
+    return JSONResponse({
+        "version": ATLAS_VERSION,
+        "modules": ", ".join(active) if active else "—",
+        "count": len(active)
+    })
+
 @app.get("/")
 async def home():
     return HTMLResponse(HTML)
@@ -1333,8 +1643,10 @@ async def home():
 async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
     await init_db()
-    loop         = asyncio.get_event_loop()
+    loop          = asyncio.get_event_loop()
     session_media = "text"
+    forced_lang   = None
+    forced_mode   = None
 
     while True:
         try:
@@ -1365,18 +1677,23 @@ async def ws_endpoint(websocket: WebSocket):
             except:
                 data = {"text": raw}
 
+            # Settings controls
             if data.get("type") == "media_mode":
                 session_media = data.get("mode","text"); continue
+            if data.get("type") == "set_lang":
+                forced_lang = data.get("lang"); continue
+            if data.get("type") == "set_mode":
+                forced_mode = data.get("mode"); continue
 
             user_msg   = data.get("text","").strip()
             file_data  = data.get("file")
             media_mode = data.get("mediaMode", session_media)
+            client_lang = data.get("forceLang")
 
             if not user_msg and not file_data:
-
                 continue
 
-            # ── APPROVE TOOL ──
+            # APPROVE TOOL
             if user_msg.lower().startswith("approve:"):
                 tool_name = user_msg.split(":", 1)[-1].strip().lower()
                 if tool_name in REQUIRES_APPROVAL:
@@ -1388,9 +1705,32 @@ async def ws_endpoint(websocket: WebSocket):
 
             if user_msg:
                 asyncio.create_task(update_profile(user_msg))
-            lang = detect_language(user_msg) if user_msg else "hr"
 
-            # ── MEMORY RECALL ──
+            # Jezik: klijent override > forced > auto detekcija
+            if client_lang and client_lang in ("hr","en","de","fr","es"):
+                lang = client_lang
+            elif forced_lang and forced_lang in ("hr","en","de","fr","es"):
+                lang = forced_lang
+            else:
+                lang = detect_language(user_msg) if user_msg else "hr"
+
+            # Lingua hints za ton adaptaciju
+            lingua_hints = {}
+            if user_msg:
+                try:
+                    lingua_hints = _lingua_adapt(user_msg)
+                except Exception as e:
+                    print(f"[LINGUA_ADAPT] {e}")
+
+            # RAG kontekst — dohvati za sistemsku poruku
+            rag_context = ""
+            if user_msg:
+                try:
+                    rag_context = _context_get(user_msg)
+                except Exception as e:
+                    print(f"[RAG_CONTEXT] {e}")
+
+            # MEMORY RECALL
             recall_kw = ["sjeti se","memory","što smo pričali","sto smo pricali",
                          "prethodni razgovor","recall"]
             if user_msg and any(k in user_msg.lower() for k in recall_kw):
@@ -1406,7 +1746,7 @@ async def ws_endpoint(websocket: WebSocket):
                     "tags": [], "mode": "fast"
                 }); continue
 
-            # ── TOOL PRIORITY ──
+            # TOOL PRIORITY
             if user_msg:
                 tool_result = handle_tool_request(user_msg)
                 if tool_result is not None:
@@ -1419,7 +1759,7 @@ async def ws_endpoint(websocket: WebSocket):
                         "tags": ["code"], "mode": "code"
                     }); continue
 
-            # ── BACKUP TRIGGER ──
+            # BACKUP TRIGGER
             backup_kw = ["prenesi na oblak","upload na oblak","spremi na oblak",
                          "prenesi fajl","backup fajl"]
             if user_msg and any(k in user_msg.lower() for k in backup_kw):
@@ -1431,7 +1771,7 @@ async def ws_endpoint(websocket: WebSocket):
                     "message":msg,"model":"SYSTEM","tags":["cloud"],"mode":"fast"
                 }); continue
 
-            # ── LOCAL MULTIMEDIA PROCESSING ──
+            # LOCAL MULTIMEDIA PROCESSING
             if file_data and user_msg:
                 media_proc = handle_media_processing(file_data, user_msg)
                 if media_proc:
@@ -1446,7 +1786,7 @@ async def ws_endpoint(websocket: WebSocket):
                         "tags": [tag], "mode": tag
                     }); continue
 
-            # ── VISION ──
+            # VISION
             if file_data and file_data.get("isImage"):
                 img_data = file_data["data"]
                 preview  = {"type":"image","data":img_data,
@@ -1461,7 +1801,7 @@ async def ws_endpoint(websocket: WebSocket):
                     "mode":"analysis","preview":preview
                 }); continue
 
-            # ── AUDIO ──
+            # AUDIO
             if file_data and file_data.get("isAudio"):
                 audio_data = file_data["data"]
                 b64  = audio_data.split(",")[-1] if "," in audio_data else audio_data
@@ -1480,7 +1820,7 @@ async def ws_endpoint(websocket: WebSocket):
                     "mode":"audio","preview":preview
                 }); continue
 
-            # ── VIDEO ──
+            # VIDEO
             if file_data and file_data.get("isVideo"):
                 video_data = file_data["data"]
                 b64  = video_data.split(",")[-1] if "," in video_data else video_data
@@ -1499,7 +1839,7 @@ async def ws_endpoint(websocket: WebSocket):
                     "mode":"video","preview":preview
                 }); continue
 
-            # ── AUTO MODE ──
+            # AUTO MODE
             if user_msg and user_msg.lower().startswith("auto "):
                 goal = user_msg[5:].strip()
                 if not goal:
@@ -1521,8 +1861,8 @@ async def ws_endpoint(websocket: WebSocket):
                     "model": model, "tags": ["auto"], "mode": "auto"
                 }); continue
 
-            # ── STANDARDNI FLOW ──
-            mode          = detect_mode(user_msg or "")
+            # STANDARDNI FLOW
+            mode          = forced_mode or detect_mode(user_msg or "")
             tags          = []
             extra_ctx     = ""
             has_real_data = False
@@ -1545,24 +1885,34 @@ async def ws_endpoint(websocket: WebSocket):
                               for k in ["vijesti","news","danas","today","trenutno"])
                 web = await loop.run_in_executor(None, _web_search, user_msg, is_news)
                 if web:
-                    # web_fix: inject real web results with anti-hallucination
-                    injected  = inject_web_results(user_msg, web, lang)
-                    extra_ctx = f"\n\n[WEB REZULTATI]\n{web}"
+                    injected      = inject_web_results(user_msg, web, lang)
+                    extra_ctx     = f"\n\n[WEB REZULTATI]\n{web}"
                     tags.append("web")
                     has_real_data = True
-                    # Override user_msg for the AI call
-                    user_msg = injected
+                    user_msg      = injected
                 else:
-                    # No web data — inject no-data signal
-                    no_data_msg = inject_web_results(user_msg, "", lang)
-                    await save_msg("user", user_msg)
-                    await save_msg("assistant", no_data_msg)
-                    try: auto_save(user_msg, no_data_msg)
-                    except: pass
-                    await websocket.send_json({
-                        "message": no_data_msg, "model": "ATLAS",
-                        "tags": [], "mode": "search"
-                    }); continue
+                    # Autonomna pretraga putem scout modula ako DDG faila
+                    scout_out = ""
+                    try:
+                        scout_out = await loop.run_in_executor(None, _scout_search, user_msg)
+                    except Exception as e:
+                        print(f"[SCOUT_FALLBACK] {e}")
+                    if scout_out:
+                        injected      = inject_web_results(user_msg, scout_out, lang)
+                        extra_ctx     = f"\n\n[WEB REZULTATI - scout]\n{scout_out}"
+                        tags.append("web")
+                        has_real_data = True
+                        user_msg      = injected
+                    else:
+                        no_data_msg = inject_web_results(user_msg, "", lang)
+                        await save_msg("user", user_msg)
+                        await save_msg("assistant", no_data_msg)
+                        try: auto_save(user_msg, no_data_msg)
+                        except: pass
+                        await websocket.send_json({
+                            "message": no_data_msg, "model": "ATLAS",
+                            "tags": [], "mode": "search"
+                        }); continue
 
             # PDF upload
             if file_data and file_data.get("isPdf"):
@@ -1584,10 +1934,14 @@ async def ws_endpoint(websocket: WebSocket):
                 f"{last_task.get('goal','')} → {last_task.get('result','')[:150]}"
                 if last_task else ""
             )
-            profile    = await get_profile()
-            history    = await get_history(10)
+            profile = await get_profile()
+            history = await get_history(10)
+
+            # build_system s RAG + lingua hints
             sys_prompt = build_system(
-                profile, mode, lang, media_mode, task_context, has_real_data
+                profile, mode, lang, media_mode,
+                task_context, has_real_data,
+                rag_context, lingua_hints
             )
 
             user_content = user_msg or ""
