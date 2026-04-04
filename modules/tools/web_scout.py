@@ -1,22 +1,27 @@
-# ---------------------------------------------------------
-# Project: ATLAS OS v18.5 - MACHINE (IMAGO)
-# Author: Iggy-Atlas
-# Year: 2026
-# License: All Rights Reserved / Proprietary
-# Description: Personal AI Operating System for Termux.
-# Intellectual Property of Iggy-Atlas.
-# ---------------------------------------------------------
+import os
+from googleapiclient.discovery import build
+from dotenv import load_dotenv
 
+load_dotenv()
 
-from duckduckgo_search import DDGS
+def search_web(query):
+    # Uzimamo isključivo ključeve za Search
+    api_key = os.getenv("GOOGLE_API_KEY")
+    cse_id = os.getenv("GOOGLE_CSE_ID")
+    
+    if not api_key or not cse_id:
+        return "Greška: Nedostaju ključevi za Google Search u .env datoteci."
 
-def get_live_info(query):
-    """Pretražuje internet za najnovije informacije."""
     try:
-        with DDGS() as ddgs:
-            results = [r for r in ddgs.text(query, max_results=5)]
-            if not results: return "Nema rezultata na mreži."
-            summary = "\n".join([f"- {r['title']}: {r['body']} ({r['href']})" for r in results])
-            return f"REZULTATI PRETRAGE:\n{summary}"
+        # Koristimo službeni Google klijent (ne šalje Access Token zaglavlje!)
+        service = build("customsearch", "v1", developerKey=api_key)
+        res = service.cse().list(q=query, cx=cse_id, num=5).execute()
+        
+        results = []
+        if 'items' in res:
+            for item in res['items']:
+                results.append(f"{item['title']}: {item['snippet']} ({item['link']})")
+            return "\n".join(results)
+        return "Nema rezultata za taj upit."
     except Exception as e:
-        return f"Greška pri pretraživanju mreže: {e}"
+        return f"Google API Greška: {str(e)}"

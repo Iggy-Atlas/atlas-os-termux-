@@ -31,3 +31,7 @@ def get_memory(key):
     with open(MEMORY_FILE, 'r') as f:
         memory = json.load(f)
     return memory.get(key)
+
+def save(user_msg, response):
+    try: add_to_index(user_msg, response)
+    except: pass
